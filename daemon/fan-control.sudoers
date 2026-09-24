@@ -1,0 +1,6 @@
+jhnlstrlclcn ALL=(root) NOPASSWD: /usr/local/bin/fan-set-level.sh
+jhnlstrlclcn ALL=(root) NOPASSWD: /usr/local/bin/fan-config-save.sh
+jhnlstrlclcn ALL=(root) NOPASSWD: /usr/local/bin/ryzenadj-set-tdp.sh
+jhnlstrlclcn ALL=(root) NOPASSWD: /usr/local/bin/ryzenadj --info
+jhnlstrlclcn ALL=(root) NOPASSWD: /usr/bin/systemctl start thinkpad-fan-control.service, /usr/bin/systemctl stop thinkpad-fan-control.service, /usr/bin/systemctl restart thinkpad-fan-control.service
+Defaults!/usr/local/bin/ryzenadj !syslog

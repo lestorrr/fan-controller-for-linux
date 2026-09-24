@@ -1,0 +1,1004 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ThinkPad Fan Control</title>
+  <style>
+    /* System font stack — the app has to work with no network, and a blocking
+       request to fonts.googleapis.com stalled first paint on every launch.
+
+       Noto Color Emoji is pulled in behind a unicode-range so it only ever
+       serves emoji. Listing it as a plain family instead makes it serve the
+       ASCII digits it also ships, which renders every number at emoji width. */
+    @font-face {
+      font-family: "EmojiOnly";
+      src: local("Noto Color Emoji");
+      unicode-range: U+23E9-23FA, U+2600-27BF, U+2B00-2BFF, U+FE0F, U+1F000-1FAFF;
+    }
+    :root {
+      --bg:            #070b14;
+      --surface:       rgba(255,255,255,0.04);
+      --surface-2:     rgba(0,0,0,0.22);
+      --border:        rgba(255,255,255,0.07);
+      --border-hi:     rgba(255,255,255,0.14);
+      --text:          #e2e8f0;
+      --muted:         #64748b;
+      --dim:           #94a3b8;
+      --accent:        #00d4ff;
+      --cool:          #00e5cc;
+      --warm:          #ff8c42;
+      --amber:         #ffb400;
+      --hot:           #ff3b5c;
+      --green:         #00e676;
+      --r:             16px;
+      --rs:            10px;
+      --sans: -apple-system, "Segoe UI", Ubuntu, Cantarell, "Noto Sans", "EmojiOnly", sans-serif;
+      --mono: "JetBrains Mono", "Fira Code", "EmojiOnly", "DejaVu Sans Mono", ui-monospace, monospace;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      background-image:
+        radial-gradient(ellipse 60% 40% at 15% 60%, rgba(0,100,255,0.07) 0%, transparent 100%),
+        radial-gradient(ellipse 50% 50% at 85% 15%, rgba(0,212,255,0.05) 0%, transparent 100%);
+      background-attachment: fixed;
+    }
+    .app { max-width: 1280px; margin: 0 auto; padding: 20px 24px 32px; }
+
+    /* ── HEADER ── */
+    header { display: flex; align-items: center; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
+    .logo {
+      width: 42px; height: 42px; flex: none;
+      background: linear-gradient(135deg, #0057ff, #00d4ff);
+      border-radius: 12px; display: flex; align-items: center;
+      justify-content: center; font-size: 21px;
+      box-shadow: 0 0 20px rgba(0,150,255,0.35);
+    }
+    .title-block h1 {
+      font-size: 19px; font-weight: 700; letter-spacing: -0.01em;
+      background: linear-gradient(90deg, #00d4ff 0%, #ffffff 60%);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .title-block p { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+    .header-spacer { flex: 1 1 auto; }
+
+    .chip {
+      display: flex; align-items: center; gap: 7px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 50px; padding: 7px 14px;
+      font-size: 12px; color: var(--dim); white-space: nowrap;
+    }
+    .chip b { font-family: var(--mono); font-weight: 600; color: var(--text); }
+    .daemon-label { font-size: 12.5px; font-weight: 500; color: var(--dim); }
+
+    .toggle { position: relative; width: 46px; height: 26px; flex: none; }
+    .toggle input { display: none; }
+    .toggle-track {
+      position: absolute; inset: 0;
+      background: rgba(255,255,255,0.08);
+      border-radius: 26px; cursor: pointer; transition: 0.3s;
+    }
+    .toggle-thumb {
+      position: absolute; top: 4px; left: 4px;
+      width: 18px; height: 18px; pointer-events: none;
+      background: #475569; border-radius: 50%; transition: 0.3s;
+    }
+    .toggle input:checked ~ .toggle-track {
+      background: rgba(0,212,255,0.25); box-shadow: 0 0 14px rgba(0,212,255,0.4);
+    }
+    .toggle input:checked ~ .toggle-thumb { background: var(--accent); transform: translateX(20px); }
+    .toggle-danger input:checked ~ .toggle-track {
+      background: rgba(255,59,92,0.25); box-shadow: 0 0 14px rgba(255,59,92,0.4);
+    }
+    .toggle-danger input:checked ~ .toggle-thumb { background: var(--hot); transform: translateX(20px); }
+
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%; flex: none;
+      background: var(--green); box-shadow: 0 0 8px var(--green);
+      animation: blink 2.5s infinite;
+    }
+    .status-dot.off { background: #2d3748; box-shadow: none; animation: none; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+    /* ── CARDS ── */
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--r); padding: 20px;
+      transition: border-color 0.25s;
+    }
+    .card:hover { border-color: var(--border-hi); }
+    .card-label {
+      font-size: 10.5px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.12em; color: var(--muted); margin-bottom: 16px;
+      display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    }
+    .card-label .hint { font-weight: 400; letter-spacing: 0.02em; text-transform: none; font-size: 10.5px; }
+
+    /* ── LAYOUT ── */
+    .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
+    /* stretch, so the chart grows to match the sidebar instead of leaving a
+       block of dead space beside it */
+    .main  { display: grid; grid-template-columns: minmax(0,1fr) 330px; gap: 14px; margin-bottom: 14px; align-items: stretch; }
+    .sidebar { display: flex; flex-direction: column; gap: 14px; }
+    @media (max-width: 1080px) {
+      .tiles { grid-template-columns: repeat(2, 1fr); }
+      .main  { grid-template-columns: minmax(0,1fr); }
+    }
+
+    /* ── GAUGE ── */
+    .gauge-wrap { display: flex; flex-direction: column; align-items: center; }
+    .gauge-svg-wrap { position: relative; width: 168px; height: 168px; }
+    .gauge-center {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+    }
+    .gauge-val { font-size: 42px; font-weight: 800; font-family: var(--mono); line-height: 1; transition: color 0.6s; }
+    .gauge-unit { font-size: 13px; color: var(--muted); margin-top: 3px; }
+    .gauge-sublabel { font-size: 11px; color: var(--muted); margin-top: 10px; text-align: center; }
+
+    /* ── SENSOR ROWS ── */
+    .sensor { margin-bottom: 13px; }
+    .sensor:last-child { margin-bottom: 0; }
+    .sensor-top { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 5px; }
+    .sensor-name { font-size: 11.5px; color: var(--dim); }
+    .sensor-val { font-size: 15px; font-weight: 700; font-family: var(--mono); transition: color 0.5s; }
+    .sensor-val.na { color: var(--muted); font-size: 12px; font-weight: 400; }
+    .bar-bg { height: 3px; background: rgba(255,255,255,0.06); border-radius: 2px; overflow: hidden; }
+    .bar { height: 100%; width: 0; border-radius: 2px; transition: width 0.6s ease, background 0.6s; }
+
+    /* ── RPM ── */
+    .rpm-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .rpm-item {
+      background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: var(--rs); padding: 14px 10px;
+      display: flex; flex-direction: column; align-items: center;
+    }
+    .rpm-val { font-size: 26px; font-weight: 800; font-family: var(--mono); transition: color 0.5s; }
+    .rpm-lbl { font-size: 10px; color: var(--muted); margin-top: 3px; }
+    .rpm-item .bar-bg { width: 100%; margin-top: 9px; }
+    .rpm-note { font-size: 10px; color: var(--muted); text-align: center; margin-top: 10px; }
+
+    /* ── MODE ── */
+    .mode-body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; padding-top: 2px; }
+    .mode-emoji { font-size: 34px; line-height: 1; }
+    .mode-name { font-size: 24px; font-weight: 800; font-family: var(--mono); transition: color 0.4s; }
+    .mode-desc { font-size: 11.5px; color: var(--muted); text-align: center; }
+    .badge { padding: 3px 12px; border-radius: 20px; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; margin-top: 2px; }
+    .badge.auto   { background: rgba(0,230,118,0.12); color: var(--green); }
+    .badge.manual { background: rgba(0,212,255,0.12); color: var(--accent); }
+    .badge.max    { background: rgba(255,59,92,0.12); color: var(--hot); }
+
+    /* ── CHART ── */
+    .chart-card { display: flex; flex-direction: column; }
+    .chart-wrap { flex: 1 1 auto; min-height: 240px; position: relative; }
+    canvas#chart { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+    .legend { display: flex; gap: 16px; align-items: center; }
+    .legend span { display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--dim); letter-spacing: 0.02em; text-transform: none; font-weight: 400; }
+    .swatch { width: 9px; height: 3px; border-radius: 2px; }
+
+    /* ── BUTTONS ── */
+    .ctrl-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+    .ctrl-btn {
+      padding: 9px 6px; border-radius: var(--rs);
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.025); color: var(--text);
+      cursor: pointer; font-family: var(--mono);
+      font-size: 12px; font-weight: 600;
+      transition: all 0.18s; text-align: center;
+    }
+    .ctrl-btn:hover  { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,0.07); }
+    .ctrl-btn:active { transform: translateY(1px); }
+    .ctrl-btn.active {
+      border-color: var(--accent); color: var(--accent);
+      box-shadow: 0 0 14px rgba(0,212,255,0.2); background: rgba(0,212,255,0.1);
+    }
+    .ctrl-btn.wide { grid-column: 1 / -1; }
+    .btn-auto { color: var(--green); border-color: rgba(0,230,118,0.2); }
+    .btn-auto:hover { border-color: var(--green); color: var(--green); background: rgba(0,230,118,0.07); }
+    .btn-auto.active { border-color: var(--green); color: var(--green); background: rgba(0,230,118,0.1); box-shadow: 0 0 14px rgba(0,230,118,0.2); }
+    .btn-max { color: var(--hot); border-color: rgba(255,59,92,0.2); }
+    .btn-max:hover { border-color: var(--hot); color: var(--hot); background: rgba(255,59,92,0.07); }
+    .btn-max.active { border-color: var(--hot); color: var(--hot); background: rgba(255,59,92,0.1); box-shadow: 0 0 16px rgba(255,59,92,0.25); }
+    .ctrl-btn.sm { font-size: 10.5px; padding: 6px 2px; }
+
+    /* ── TDP ── */
+    .kv { display: flex; justify-content: space-between; align-items: baseline; font-size: 11.5px; color: var(--dim); margin-bottom: 9px; }
+    .kv b { font-family: var(--mono); font-size: 14px; font-weight: 700; }
+    .slider-row { display: flex; align-items: center; gap: 11px; margin: 4px 0 10px; }
+    input[type=range] { flex: 1; accent-color: var(--accent); cursor: pointer; min-width: 0; }
+    .slider-lbl { width: 46px; font-family: var(--mono); font-size: 13px; font-weight: 600; text-align: right; }
+
+    /* ── DANGER ── */
+    .danger { border-color: rgba(255,59,92,0.25); }
+    .danger .card-label { color: var(--hot); }
+    .danger-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .danger-row span { font-size: 11.5px; color: var(--dim); font-weight: 500; }
+    .danger p { font-size: 9.5px; color: var(--muted); line-height: 1.4; margin-top: 4px; }
+    .danger hr { border: 0; border-top: 1px solid rgba(255,59,92,0.15); margin: 13px 0; }
+
+    /* ── CURVE EDITOR ── */
+    .curve-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 11px; }
+    @media (max-width: 900px) { .curve-row { grid-template-columns: repeat(2, 1fr); } }
+    .curve-step {
+      border-radius: var(--rs); padding: 13px 12px;
+      border: 1px solid var(--border); background: var(--surface-2);
+      display: flex; flex-direction: column; gap: 8px;
+      position: relative; overflow: hidden; transition: box-shadow 0.3s, border-color 0.3s;
+    }
+    .curve-step::before { content: ''; position: absolute; inset: 0; opacity: 0.06; pointer-events: none; }
+    .curve-step.active-step { box-shadow: 0 0 0 1px currentColor, 0 0 16px -4px currentColor; }
+    .curve-dot { width: 8px; height: 8px; border-radius: 50%; position: absolute; top: 11px; right: 11px; opacity: 0.35; transition: opacity 0.3s, box-shadow 0.3s; }
+    .curve-step.active-step .curve-dot { opacity: 1; box-shadow: 0 0 9px currentColor; }
+    .curve-field { display: flex; align-items: center; gap: 7px; }
+    .curve-field label { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; width: 34px; flex: none; }
+    .curve-step input[type=number], .curve-step select {
+      flex: 1; min-width: 0; background: rgba(0,0,0,0.35); color: var(--text);
+      border: 1px solid var(--border); border-radius: 7px;
+      padding: 5px 7px; font-family: var(--mono); font-size: 12px; font-weight: 600;
+    }
+    .curve-step input:focus, .curve-step select:focus { outline: none; border-color: var(--accent); }
+    .curve-step input:disabled { opacity: 0.5; cursor: not-allowed; }
+    .curve-rpm { font-size: 10px; color: var(--muted); font-family: var(--mono); text-align: right; }
+    .curve-actions { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+    .curve-actions .ctrl-btn { padding: 7px 16px; }
+    .tabs { display: flex; gap: 4px; background: var(--surface-2); border-radius: 8px; padding: 3px; }
+    .tab {
+      padding: 5px 12px; border-radius: 6px; border: 0; cursor: pointer;
+      background: transparent; color: var(--muted);
+      font-family: var(--sans); font-size: 11px; font-weight: 600;
+    }
+    .tab.on { background: rgba(0,212,255,0.14); color: var(--accent); }
+    .dirty { color: var(--amber); font-size: 11px; margin-left: auto; }
+
+    /* ── LOG ── */
+    .log-box {
+      font-family: var(--mono); font-size: 11.5px; line-height: 1.8; color: var(--dim);
+      height: 150px; overflow-y: auto; padding-right: 4px; white-space: pre-wrap; word-break: break-word;
+    }
+    .log-box::-webkit-scrollbar { width: 3px; }
+    .log-box::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+    .log-ts { color: #3f4a5c; }
+    .log-warn { color: var(--amber); }
+    .log-crit { color: var(--hot); }
+    .log-info { color: var(--accent); }
+
+    /* ── TOAST + BANNER ── */
+    .toast {
+      position: fixed; bottom: 24px; right: 24px; z-index: 1000;
+      padding: 11px 20px; border-radius: 10px;
+      background: rgba(10,16,28,0.96); border: 1px solid rgba(0,212,255,0.3);
+      color: var(--accent); font-size: 13px; font-weight: 500;
+      opacity: 0; transform: translateY(14px); transition: all 0.28s;
+      pointer-events: none; box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+    }
+    .toast.show  { opacity: 1; transform: translateY(0); }
+    .toast.warn  { border-color: rgba(255,140,66,0.4); color: var(--warm); }
+    .toast.error { border-color: rgba(255,59,92,0.4);  color: var(--hot); }
+    #banner {
+      position: sticky; top: 0; z-index: 900; margin: -20px -24px 16px; padding: 10px;
+      text-align: center; background: rgba(255,20,60,0.16);
+      border-bottom: 1px solid rgba(255,20,60,0.4); color: var(--hot);
+      font-size: 13px; font-weight: 600; letter-spacing: 0.03em;
+      animation: blink 1.2s infinite; display: none;
+    }
+    #banner.show { display: block; }
+
+    .offline { opacity: 0.45; transition: opacity 0.3s; }
+
+    @keyframes fadeUp { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+    .card { animation: fadeUp 0.35s ease backwards; }
+    .tiles .card:nth-child(1){animation-delay:.03s} .tiles .card:nth-child(2){animation-delay:.06s}
+    .tiles .card:nth-child(3){animation-delay:.09s} .tiles .card:nth-child(4){animation-delay:.12s}
+    .main  .card{animation-delay:.15s} .curve-card{animation-delay:.18s} .log-card{animation-delay:.21s}
+  </style>
+</head>
+<body>
+<div class="app" id="app">
+
+  <div id="banner"></div>
+
+  <header>
+    <div class="logo">💨</div>
+    <div class="title-block">
+      <h1>Fan Control</h1>
+      <p>ThinkPad T495 · thinkpad_acpi</p>
+    </div>
+    <div class="header-spacer"></div>
+    <div class="chip" id="power-chip" title="Power source">🔌 <b id="power-val">—</b></div>
+    <div class="chip" title="Curve input: hottest of CPU and iGPU">🎯 Control <b id="ctrl-temp">—</b></div>
+    <div class="chip">
+      <span class="daemon-label">Auto Curve</span>
+      <label class="toggle"><input type="checkbox" id="daemon-cb"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+      <div class="status-dot off" id="sdot"></div>
+    </div>
+  </header>
+
+  <!-- ── TILES ── -->
+  <div class="tiles">
+
+    <div class="card">
+      <div class="card-label">CPU Temperature</div>
+      <div class="gauge-wrap">
+        <div class="gauge-svg-wrap">
+          <svg viewBox="0 0 200 200" width="168" height="168">
+            <circle cx="100" cy="100" r="80" fill="none" stroke="rgba(255,255,255,0.05)"
+              stroke-width="12" stroke-dasharray="376.99 502.65" stroke-linecap="round"
+              transform="rotate(135 100 100)"/>
+            <circle id="gauge-arc" cx="100" cy="100" r="80" fill="none" stroke="#00e5cc"
+              stroke-width="12" stroke-dasharray="0 502.65" stroke-linecap="round"
+              transform="rotate(135 100 100)"
+              style="transition: stroke-dasharray 0.8s ease, stroke 0.7s ease;"/>
+            <text x="26" y="168" fill="rgba(255,255,255,0.18)" font-size="9">0°</text>
+            <text x="156" y="168" fill="rgba(255,255,255,0.18)" font-size="9">100°</text>
+          </svg>
+          <div class="gauge-center">
+            <div class="gauge-val" id="temp-val" style="color:#00e5cc">--</div>
+            <div class="gauge-unit">°C</div>
+          </div>
+        </div>
+        <div class="gauge-sublabel" id="temp-zone">Reading…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Other Sensors</div>
+      <div class="sensor">
+        <div class="sensor-top"><span class="sensor-name">iGPU · Vega</span><span class="sensor-val" id="s-igpu">--</span></div>
+        <div class="bar-bg"><div class="bar" id="b-igpu"></div></div>
+      </div>
+      <div class="sensor">
+        <div class="sensor-top"><span class="sensor-name">NVMe SSD</span><span class="sensor-val" id="s-nvme">--</span></div>
+        <div class="bar-bg"><div class="bar" id="b-nvme"></div></div>
+      </div>
+      <div class="sensor">
+        <div class="sensor-top"><span class="sensor-name">Wi-Fi</span><span class="sensor-val" id="s-wifi">--</span></div>
+        <div class="bar-bg"><div class="bar" id="b-wifi"></div></div>
+      </div>
+      <div class="sensor">
+        <div class="sensor-top"><span class="sensor-name">Battery</span><span class="sensor-val" id="s-bat">--</span></div>
+        <div class="bar-bg"><div class="bar" id="b-bat"></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Fan Speed</div>
+      <div class="rpm-grid">
+        <div class="rpm-item">
+          <div class="rpm-val" id="fan1-val" style="color:var(--accent)">--</div>
+          <div class="rpm-lbl">Fan 1 · RPM</div>
+          <div class="bar-bg"><div class="bar" id="fan1-bar"></div></div>
+        </div>
+        <div class="rpm-item">
+          <div class="rpm-val" id="fan2-val" style="color:var(--accent)">--</div>
+          <div class="rpm-lbl">Fan 2 · RPM</div>
+          <div class="bar-bg"><div class="bar" id="fan2-bar"></div></div>
+        </div>
+      </div>
+      <div class="rpm-note" id="fan-note">EC reports <span id="ec-speed">--</span> RPM</div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Fan Mode</div>
+      <div class="mode-body">
+        <div class="mode-emoji" id="mode-emoji">⚙️</div>
+        <div class="mode-name" id="mode-name">--</div>
+        <div class="mode-desc" id="mode-desc">Loading…</div>
+        <span class="badge auto" id="mode-badge">AUTO</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── CHART + SIDEBAR ── -->
+  <div class="main">
+
+    <div class="card chart-card">
+      <div class="card-label">
+        <span id="chart-title">Temperature History</span>
+        <span class="legend">
+          <span><i class="swatch" style="background:#00d4ff"></i>CPU</span>
+          <span><i class="swatch" style="background:#c084fc"></i>iGPU</span>
+          <span><i class="swatch" style="background:rgba(255,255,255,0.35)"></i>Fan RPM</span>
+        </span>
+      </div>
+      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+    </div>
+
+    <div class="sidebar">
+
+      <div class="card">
+        <div class="card-label"><span>Fan Controls</span><span class="hint">keys 0–7 · A · M</span></div>
+        <div class="ctrl-grid">
+          <button class="ctrl-btn btn-auto wide" id="btn-daemon" data-act="daemon">🤖 AUTO CURVE (Daemon)</button>
+          <button class="ctrl-btn wide" id="btn-auto" data-act="level" data-level="auto">🍃 Firmware Auto</button>
+          <button class="ctrl-btn" id="btn-0" data-act="level" data-level="0">0</button>
+          <button class="ctrl-btn" id="btn-1" data-act="level" data-level="1">1</button>
+          <button class="ctrl-btn" id="btn-2" data-act="level" data-level="2">2</button>
+          <button class="ctrl-btn" id="btn-3" data-act="level" data-level="3">3</button>
+          <button class="ctrl-btn" id="btn-4" data-act="level" data-level="4">4</button>
+          <button class="ctrl-btn" id="btn-5" data-act="level" data-level="5">5</button>
+          <button class="ctrl-btn" id="btn-6" data-act="level" data-level="6">6</button>
+          <button class="ctrl-btn" id="btn-7" data-act="level" data-level="7">7</button>
+          <button class="ctrl-btn btn-max wide" id="btn-disengaged" data-act="level" data-level="disengaged">🔥 MAX · disengaged</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Ryzen TDP Control</div>
+        <div class="kv"><span>Sustained limit (STAPM)</span><b id="tdp-current-val" style="color:var(--accent)">-- W</b></div>
+        <div class="kv"><span>APU power draw</span><b id="cpu-power-val" style="color:var(--amber)">-- W</b></div>
+        <div class="kv"><span>VRM current (EDC)</span><b id="edc-val" style="color:var(--dim)">--</b></div>
+        <div class="slider-row">
+          <input type="range" id="tdp-slider" min="5" max="35" value="22">
+          <span class="slider-lbl" id="tdp-slider-lbl">22 W</span>
+        </div>
+        <button class="ctrl-btn wide" id="btn-apply-tdp" style="width:100%;border-color:var(--accent);color:var(--accent);font-size:11px;padding:7px 0;">⚡ Apply TDP Limit</button>
+        <div class="ctrl-grid" style="grid-template-columns:1fr 1fr;margin-top:8px;">
+          <button class="ctrl-btn sm" data-act="tdp" data-tdp="12">🔋 12W Quiet</button>
+          <button class="ctrl-btn sm" data-act="tdp" data-tdp="18">🍃 18W Eco</button>
+          <button class="ctrl-btn sm" data-act="tdp" data-tdp="25">⚖️ 25W Bal</button>
+          <button class="ctrl-btn sm" data-act="tdp" data-tdp="35">🌪️ 35W Max</button>
+        </div>
+      </div>
+
+      <div class="card danger">
+        <div class="card-label">⚠️ Danger Zone</div>
+        <div class="danger-row">
+          <span>Persistent TDP Lock</span>
+          <label class="toggle toggle-danger"><input type="checkbox" id="tdp-lock-cb"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <p>Re-applies the TDP limit every 5 s so firmware power profiles can't quietly reset it.</p>
+        <hr>
+        <div class="danger-row">
+          <span>Unlock VRM Current (EDC)</span>
+          <label class="toggle toggle-danger"><input type="checkbox" id="vrm-unlock-cb"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+        </div>
+        <p>Raises EDC 45 A → 60 A and TDC 35 A → 42 A. Lets sustained draw exceed ~17 W, at the cost of running the VRMs above their stock limit.</p>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── CURVE EDITOR ── -->
+  <div class="card curve-card" style="margin-bottom:14px;">
+    <div class="card-label">
+      <span>Fan Curve</span>
+      <span class="hint" id="curve-hint">Applies when Auto Curve is on</span>
+    </div>
+    <div class="curve-actions" style="margin:0 0 14px;">
+      <div class="tabs">
+        <button class="tab on" id="tab-ac" data-curve="curve">⚡ On AC</button>
+        <button class="tab"    id="tab-bat" data-curve="battery_curve">🔋 On Battery</button>
+      </div>
+      <div class="danger-row" style="gap:8px;">
+        <span style="font-size:11px;">Use battery curve</span>
+        <label class="toggle"><input type="checkbox" id="usebat-cb"><div class="toggle-track"></div><div class="toggle-thumb"></div></label>
+      </div>
+      <span class="dirty" id="dirty-flag"></span>
+    </div>
+    <div class="curve-row" id="curve-row"></div>
+    <div class="curve-actions">
+      <button class="ctrl-btn" id="btn-curve-save" style="border-color:var(--green);color:var(--green);">💾 Save Curve</button>
+      <button class="ctrl-btn" id="btn-curve-reload">↺ Discard Changes</button>
+      <button class="ctrl-btn" id="btn-curve-default">⟲ Restore Defaults</button>
+      <div class="curve-field" style="margin-left:auto;gap:9px;">
+        <label style="width:auto;">Hysteresis</label>
+        <input type="number" id="hyst-input" min="0" max="20" step="1"
+               style="width:64px;background:rgba(0,0,0,.35);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:5px 7px;font-family:var(--mono);font-size:12px;font-weight:600;">
+        <label style="width:auto;">Critical</label>
+        <input type="number" id="crit-input" min="70" max="105" step="1"
+               style="width:64px;background:rgba(0,0,0,.35);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:5px 7px;font-family:var(--mono);font-size:12px;font-weight:600;">
+      </div>
+    </div>
+  </div>
+
+  <!-- ── LOG ── -->
+  <div class="card log-card">
+    <div class="card-label"><span>Daemon Log</span><span class="hint" id="log-ts">--</span></div>
+    <div class="log-box" id="log-box">Loading…</div>
+  </div>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const HIST_LEN = 100;          // 100 samples × 3 s ≈ 5 minutes
+const hist = { cpu: [], igpu: [], rpm: [] };
+let MAX_RPM = 6300;
+let config = null;             // last config loaded from the daemon
+let draft  = null;             // local edits, not yet saved
+let activeCurve = "curve";
+let lastStatus = null;
+let failures = 0;
+
+const $ = id => document.getElementById(id);
+
+/* Approximate steady-state RPM per level on a T495 — labels only. */
+const LEVEL_RPM = {
+  "0":"~0", "1":"~2200", "2":"~2500", "3":"~2800", "4":"~3100",
+  "5":"~3500", "6":"~4000", "7":"~5000",
+  "disengaged":"~6300", "full-speed":"~6300", "auto":"varies"
+};
+const LEVEL_OPTIONS = ["auto","0","1","2","3","4","5","6","7","disengaged"];
+const STEP_COLORS = ["#00e5cc","#ff8c42","#ffb400","#ff6400","#ff3b5c"];
+
+/* ── colour helpers ── */
+const tempColor = t => t < 50 ? "#00e5cc" : t < 65 ? "#ff8c42" : t < 80 ? "#ffb400" : "#ff3b5c";
+const rpmColor  = r => r > 5000 ? "#ff3b5c" : r > 3200 ? "#ff8c42" : "#00d4ff";
+
+/* ── tiles ── */
+function updateGauge(temp) {
+  const color = tempColor(temp);
+  const arc = $("gauge-arc");
+  arc.setAttribute("stroke-dasharray", `${Math.min(temp/100,1)*376.99} 502.65`);
+  arc.setAttribute("stroke", color);
+  const v = $("temp-val");
+  v.textContent = temp || "--";
+  v.style.color = color;
+  $("temp-zone").textContent =
+    temp < 50 ? "❄️ Cool" : temp < 65 ? "🌡️ Warm" : temp < 80 ? "⚡ Hot" : "🔥 Very hot";
+}
+
+function setSensor(id, temp, max = 100) {
+  const el = $("s-" + id), bar = $("b-" + id);
+  if (temp === null || temp === undefined) {
+    el.textContent = "n/a"; el.className = "sensor-val na"; bar.style.width = "0";
+    return;
+  }
+  el.className = "sensor-val";
+  el.textContent = temp + "°C";
+  const c = tempColor(temp);
+  el.style.color = c;
+  bar.style.width = Math.min(temp / max * 100, 100) + "%";
+  bar.style.background = c;
+}
+
+function updateSensors(d) {
+  setSensor("igpu", d.temps.igpu);
+  setSensor("nvme", d.temps.nvme);
+  setSensor("wifi", d.temps.wifi);
+
+  const el = $("s-bat"), bar = $("b-bat");
+  if (d.battery_pct >= 0) {
+    const w = d.battery_watts != null && !d.on_ac ? ` · ${d.battery_watts} W` : "";
+    el.className = "sensor-val";
+    el.textContent = `${d.battery_pct}%${w}`;
+    el.style.color = d.battery_pct < 20 && !d.on_ac ? "#ff3b5c" : "#94a3b8";
+    bar.style.width = d.battery_pct + "%";
+    bar.style.background = d.battery_pct < 20 ? "#ff3b5c" : "#00e676";
+  } else {
+    el.textContent = "n/a"; el.className = "sensor-val na"; bar.style.width = "0";
+  }
+
+  $("power-val").textContent = d.on_ac ? "AC" : `Battery ${d.battery_pct}%`;
+  $("power-chip").firstChild.nodeValue = d.on_ac ? "🔌 " : "🔋 ";
+  $("ctrl-temp").textContent = d.temp_c + "°C";
+}
+
+function updateRPM(d) {
+  [[ "fan1", d.fan1_rpm ], [ "fan2", d.fan2_rpm ]].forEach(([id, rpm]) => {
+    const c = rpmColor(rpm);
+    $(id + "-val").textContent = rpm.toLocaleString();
+    $(id + "-val").style.color = c;
+    const bar = $(id + "-bar");
+    bar.style.width = Math.min(rpm / MAX_RPM * 100, 100) + "%";
+    bar.style.background = `linear-gradient(90deg,#0057ff,${c})`;
+  });
+  $("ec-speed").textContent = d.speed;
+}
+
+const MODES = {
+  auto:        {emoji:"🤖", name:"AUTO",    desc:"Firmware controlled",       badge:"auto",   text:"FIRMWARE"},
+  "0":         {emoji:"😴", name:"LEVEL 0", desc:"Fan off",                   badge:"manual", text:"MANUAL"},
+  "1":         {emoji:"🍃", name:"LEVEL 1", desc:"Very quiet",                badge:"manual", text:"MANUAL"},
+  "2":         {emoji:"🌬️", name:"LEVEL 2", desc:"Low speed",                 badge:"manual", text:"MANUAL"},
+  "3":         {emoji:"💨", name:"LEVEL 3", desc:"Low-medium",                badge:"manual", text:"MANUAL"},
+  "4":         {emoji:"💨", name:"LEVEL 4", desc:"~3100 RPM · balanced",      badge:"manual", text:"MANUAL"},
+  "5":         {emoji:"💨", name:"LEVEL 5", desc:"Medium-high",               badge:"manual", text:"MANUAL"},
+  "6":         {emoji:"🌀", name:"LEVEL 6", desc:"~4000 RPM · audible",       badge:"manual", text:"MANUAL"},
+  "7":         {emoji:"🌀", name:"LEVEL 7", desc:"~5000 RPM · loud",          badge:"manual", text:"MANUAL"},
+  disengaged:  {emoji:"🔥", name:"MAX",     desc:"~6300 RPM · unrestricted",  badge:"max",    text:"MAX SPEED"},
+  "full-speed":{emoji:"🔥", name:"MAX",     desc:"~6300 RPM · unrestricted",  badge:"max",    text:"MAX SPEED"}
+};
+
+function updateMode(level, daemonActive) {
+  const m = MODES[level] || {emoji:"⚙️", name:String(level).toUpperCase(), desc:"Custom level", badge:"manual", text:"MANUAL"};
+  $("mode-emoji").textContent = m.emoji;
+  $("mode-name").textContent  = daemonActive ? m.name : m.name;
+  $("mode-desc").textContent  = daemonActive ? "Set by auto curve" : m.desc;
+  const b = $("mode-badge");
+  b.className = "badge " + (daemonActive ? "auto" : m.badge);
+  b.textContent = daemonActive ? "AUTO CURVE" : m.text;
+
+  document.querySelectorAll(".ctrl-btn").forEach(e => e.classList.remove("active"));
+  if (daemonActive) $("btn-daemon").classList.add("active");
+  else ($("btn-" + level) || {classList:{add(){}}}).classList.add("active");
+}
+
+/* ── chart ── */
+function drawChart() {
+  const c = $("chart");
+  const w = c.clientWidth, h = c.clientHeight;
+  if (!w || !h) return;
+  const dpr = window.devicePixelRatio || 1;
+  c.width = w * dpr; c.height = h * dpr;
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (hist.cpu.length < 2) return;
+
+  const LO = 30, HI = 100, PAD = 22;
+  const y = t => h - PAD - (Math.max(LO, Math.min(HI, t)) - LO) / (HI - LO) * (h - PAD * 1.4);
+  // Span the full width from the first sample on. Scaling against HIST_LEN
+  // instead would leave the trace stranded in a corner until the buffer fills.
+  const span = Math.max(hist.cpu.length - 1, 1);
+  const x = i => i / span * w;
+
+  // gridlines
+  ctx.font = "9px monospace";
+  for (const t of [40, 50, 60, 70, 80, 90]) {
+    ctx.beginPath();
+    ctx.strokeStyle = t === 80 ? "rgba(255,59,92,0.18)" : "rgba(255,255,255,0.05)";
+    ctx.lineWidth = 1; ctx.setLineDash([3, 6]);
+    ctx.moveTo(0, y(t)); ctx.lineTo(w, y(t)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(255,255,255,0.2)";
+    ctx.fillText(t + "°", 4, y(t) - 3);
+  }
+
+  // fan RPM as a background area on its own scale
+  ctx.beginPath();
+  ctx.moveTo(0, h - PAD);
+  hist.rpm.forEach((r, i) => ctx.lineTo(x(i), h - PAD - (r / MAX_RPM) * (h - PAD * 1.4)));
+  ctx.lineTo(x(hist.rpm.length - 1), h - PAD);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255,255,255,0.045)";
+  ctx.fill();
+
+  const series = [
+    { data: hist.cpu,  color: "#00d4ff", fill: true  },
+    { data: hist.igpu, color: "#c084fc", fill: false }
+  ];
+  for (const s of series) {
+    const pts = s.data.filter(v => v !== null);
+    if (pts.length < 2) continue;
+    if (s.fill) {
+      const g = ctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, s.color + "44");
+      g.addColorStop(1, s.color + "00");
+      ctx.beginPath();
+      ctx.moveTo(0, h - PAD);
+      s.data.forEach((v, i) => { if (v !== null) ctx.lineTo(x(i), y(v)); });
+      ctx.lineTo(x(s.data.length - 1), h - PAD);
+      ctx.closePath(); ctx.fillStyle = g; ctx.fill();
+    }
+    ctx.beginPath();
+    let started = false;
+    s.data.forEach((v, i) => {
+      if (v === null) return;
+      started ? ctx.lineTo(x(i), y(v)) : (ctx.moveTo(x(i), y(v)), started = true);
+    });
+    ctx.strokeStyle = s.color; ctx.lineWidth = 2;
+    ctx.shadowColor = s.color; ctx.shadowBlur = 7;
+    ctx.stroke(); ctx.shadowBlur = 0;
+
+    const last = s.data[s.data.length - 1];
+    if (last !== null) {
+      ctx.beginPath();
+      ctx.arc(x(s.data.length - 1), y(last), 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = s.color; ctx.shadowColor = s.color; ctx.shadowBlur = 12;
+      ctx.fill(); ctx.shadowBlur = 0;
+    }
+  }
+}
+
+function pushHistory(d) {
+  hist.cpu.push(d.temps.cpu ?? null);
+  hist.igpu.push(d.temps.igpu ?? null);
+  hist.rpm.push(Math.max(d.fan1_rpm, d.fan2_rpm));
+  for (const k of Object.keys(hist)) while (hist[k].length > HIST_LEN) hist[k].shift();
+  const secs = (hist.cpu.length - 1) * 3;
+  $("chart-title").textContent = "Temperature History · last " +
+    (secs < 90 ? `${secs} s` : `${Math.round(secs / 60)} min`);
+}
+
+/* ── curve editor ── */
+function renderCurve() {
+  if (!draft) return;
+  const steps = draft[activeCurve];
+  const row = $("curve-row");
+  row.innerHTML = "";
+  steps.forEach((step, i) => {
+    const color = STEP_COLORS[Math.min(i, STEP_COLORS.length - 1)];
+    const div = document.createElement("div");
+    div.className = "curve-step";
+    div.style.color = color;
+    div.style.borderColor = color + "40";
+    div.dataset.idx = i;
+    div.innerHTML = `
+      <div class="curve-dot" style="background:${color}"></div>
+      <div class="curve-field">
+        <label>${i === 0 ? "Base" : "At"}</label>
+        <input type="number" min="0" max="105" step="1" value="${step.temp}"
+               data-field="temp" ${i === 0 ? "disabled" : ""}>
+        <span style="font-size:11px;color:var(--muted)">°C</span>
+      </div>
+      <div class="curve-field">
+        <label>Fan</label>
+        <select data-field="level">
+          ${LEVEL_OPTIONS.map(o => `<option value="${o}"${o === step.level ? " selected" : ""}>${o}</option>`).join("")}
+        </select>
+      </div>
+      <div class="curve-rpm">${LEVEL_RPM[step.level] || ""} RPM</div>`;
+    row.appendChild(div);
+  });
+  markDirty();
+  if (lastStatus) highlightStep(lastStatus.temp_c);
+}
+
+function readCurveInputs() {
+  const steps = draft[activeCurve];
+  document.querySelectorAll("#curve-row .curve-step").forEach(el => {
+    const i = +el.dataset.idx;
+    const t = el.querySelector('[data-field="temp"]');
+    const l = el.querySelector('[data-field="level"]');
+    steps[i].temp  = i === 0 ? 0 : Math.max(0, Math.min(105, parseInt(t.value, 10) || 0));
+    steps[i].level = l.value;
+  });
+  draft.hysteresis    = Math.max(0, Math.min(20,  parseInt($("hyst-input").value, 10) || 0));
+  draft.critical_temp = Math.max(70, Math.min(105, parseInt($("crit-input").value, 10) || 90));
+  draft.use_battery_curve = $("usebat-cb").checked;
+}
+
+function markDirty() {
+  const changed = JSON.stringify(draft) !== JSON.stringify(config);
+  $("dirty-flag").textContent = changed ? "● unsaved changes" : "";
+}
+
+/* Which curve step the daemon would currently be sitting on. */
+function highlightStep(temp) {
+  const onBattery = lastStatus && !lastStatus.on_ac && config && config.use_battery_curve;
+  const shown = activeCurve === (onBattery ? "battery_curve" : "curve");
+  const steps = draft ? draft[activeCurve] : [];
+  let active = -1;
+  if (shown) for (let i = 0; i < steps.length; i++) if (temp >= steps[i].temp) active = i;
+  document.querySelectorAll("#curve-row .curve-step").forEach((el, i) =>
+    el.classList.toggle("active-step", i === active));
+  $("curve-hint").textContent = shown
+    ? (lastStatus && lastStatus.daemon_active ? "Live — highlighted step is active" : "Applies when Auto Curve is on")
+    : `Not in use right now (system is on ${onBattery ? "battery" : "AC"})`;
+}
+
+async function loadConfig() {
+  try {
+    config = await (await fetch("/api/config")).json();
+    draft  = JSON.parse(JSON.stringify(config));
+    $("hyst-input").value  = draft.hysteresis;
+    $("crit-input").value  = draft.critical_temp;
+    $("usebat-cb").checked = draft.use_battery_curve;
+    renderCurve();
+  } catch (e) { /* server still starting */ }
+}
+
+async function saveCurve() {
+  readCurveInputs();
+  const temps = draft[activeCurve].map(s => s.temp);
+  if (new Set(temps).size !== temps.length) {
+    toast("✗ Two steps share the same temperature", "error");
+    return;
+  }
+  const res = await post("/api/config", draft);
+  if (res && res.success) {
+    toast("✓ Curve saved — daemon reloaded");
+    await loadConfig();
+  } else {
+    toast("✗ Could not save curve", "error");
+  }
+}
+
+/* ── actions ── */
+async function post(url, body) {
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body || {})
+    });
+    return await r.json();
+  } catch (e) { return null; }
+}
+
+async function setFan(level) {
+  if (lastStatus && lastStatus.daemon_active) {
+    await post("/api/daemon/stop");
+    toast("⚠️ Auto curve paused — manual override", "warn");
+    await new Promise(r => setTimeout(r, 250));
+  }
+  const res = await post("/api/fan/set", {level});
+  if (res && res.success) {
+    toast(`✓ Fan → ${level === "disengaged" ? "MAX SPEED" : "level " + level}`);
+    refresh();
+  } else {
+    toast("✗ Failed to set fan level", "error");
+  }
+}
+
+async function toggleDaemon(on) {
+  const res = await post(on ? "/api/daemon/start" : "/api/daemon/stop");
+  if (res && res.success) {
+    toast(on ? "✓ Auto curve enabled" : "⏹ Auto curve stopped");
+    setTimeout(refresh, 900);
+  } else {
+    $("daemon-cb").checked = !on;
+    toast("✗ Failed to toggle the daemon", "error");
+  }
+}
+
+async function setTdp(watts) {
+  toast(`⚡ Setting TDP to ${watts} W…`);
+  const res = await post("/api/tdp/set", {tdp: watts});
+  toast(res && res.success ? `✓ TDP set to ${watts} W` : "✗ Failed to set TDP",
+        res && res.success ? "" : "error");
+  refresh();
+}
+
+/* ── log ── */
+function updateLog(text) {
+  const el = $("log-box");
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+  const lines = text.trim().split("\n").filter(Boolean);
+  el.innerHTML = lines.map(line => {
+    const m = line.match(/^\[(\S+) (\S+)\] (.*)$/);
+    if (!m) return `<div>${esc(line)}</div>`;
+    const msg = m[3];
+    const cls = /CRITICAL|ALERT|FATAL|ERROR/.test(msg) ? "log-crit"
+              : /WARN/.test(msg) ? "log-warn"
+              : /started|reloaded|Fan →/.test(msg) ? "log-info" : "";
+    return `<div><span class="log-ts">${m[2]}</span>  <span class="${cls}">${esc(msg)}</span></div>`;
+  }).join("") || "<div>No log entries yet.</div>";
+  if (atBottom) el.scrollTop = el.scrollHeight;
+  $("log-ts").textContent = "updated " + new Date().toLocaleTimeString();
+}
+const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+/* ── toast ── */
+let toastTimer;
+function toast(msg, type = "") {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show" + (type ? " " + type : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.className = "toast", 2600);
+}
+
+/* ── main refresh ── */
+async function refresh() {
+  let d;
+  try {
+    d = await (await fetch("/api/status")).json();
+  } catch (e) {
+    if (++failures > 2) $("app").classList.add("offline");
+    return;
+  }
+  failures = 0;
+  $("app").classList.remove("offline");
+  lastStatus = d;
+  MAX_RPM = d.max_rpm || MAX_RPM;
+
+  updateGauge(d.temps.cpu ?? d.temp_c);
+  updateSensors(d);
+  updateRPM(d);
+  updateMode(d.level, d.daemon_active);
+  pushHistory(d);
+  drawChart();
+  highlightStep(d.temp_c);
+
+  $("daemon-cb").checked = d.daemon_active;
+  $("sdot").className = "status-dot" + (d.daemon_active ? "" : " off");
+
+  $("tdp-current-val").textContent = d.tdp + " W";
+  $("cpu-power-val").textContent = d.power.toFixed(1) + " W";
+  $("edc-val").textContent = d.edc_limit ? `${d.edc.toFixed(1)} / ${d.edc_limit.toFixed(0)} A` : "n/a";
+  $("edc-val").style.color = d.edc_limit && d.edc > d.edc_limit * 0.95 ? "var(--hot)" : "var(--dim)";
+
+  const slider = $("tdp-slider");
+  if (document.activeElement !== slider) {
+    slider.value = d.tdp;
+    $("tdp-slider-lbl").textContent = d.tdp + " W";
+  }
+  $("tdp-lock-cb").checked   = d.tdp_locked;
+  $("vrm-unlock-cb").checked = d.vrm_unlocked;
+
+  const crit = (config && config.critical_temp) || 90;
+  const banner = $("banner");
+  banner.classList.toggle("show", d.temp_c >= crit);
+  if (d.temp_c >= crit) banner.textContent = `🚨 ${d.temp_c}°C — at critical threshold, fan forced to maximum`;
+}
+
+async function refreshLog() {
+  try { updateLog(await (await fetch("/api/log")).text()); } catch (e) {}
+}
+
+/* ── wiring ── */
+document.addEventListener("click", e => {
+  const btn = e.target.closest("[data-act]");
+  if (!btn) return;
+  const act = btn.dataset.act;
+  if (act === "level")  setFan(btn.dataset.level);
+  if (act === "tdp")    { $("tdp-slider").value = btn.dataset.tdp;
+                          $("tdp-slider-lbl").textContent = btn.dataset.tdp + " W";
+                          setTdp(+btn.dataset.tdp); }
+  if (act === "daemon") toggleDaemon(!$("daemon-cb").checked);
+});
+
+$("daemon-cb").addEventListener("change", function () { toggleDaemon(this.checked); });
+$("tdp-slider").addEventListener("input", function () { $("tdp-slider-lbl").textContent = this.value + " W"; });
+$("btn-apply-tdp").addEventListener("click", () => setTdp(+$("tdp-slider").value));
+
+$("tdp-lock-cb").addEventListener("change", async function () {
+  const r = await post("/api/tdp/lock", {locked: this.checked});
+  toast(r && r.success ? (this.checked ? "🔒 TDP lock enabled" : "🔓 TDP lock released") : "✗ Failed", r && r.success ? "" : "error");
+});
+$("vrm-unlock-cb").addEventListener("change", async function () {
+  const r = await post("/api/tdp/vrm_unlock", {unlocked: this.checked});
+  toast(r && r.success ? (this.checked ? "⚠️ VRM current limits unlocked" : "✓ Stock VRM limits restored") : "✗ Failed",
+        this.checked ? "warn" : (r && r.success ? "" : "error"));
+});
+
+document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => {
+  readCurveInputs();
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("on"));
+  tab.classList.add("on");
+  activeCurve = tab.dataset.curve;
+  renderCurve();
+}));
+$("curve-row").addEventListener("input", () => { readCurveInputs(); renderCurve(); });
+$("hyst-input").addEventListener("input", () => { readCurveInputs(); markDirty(); });
+$("crit-input").addEventListener("input", () => { readCurveInputs(); markDirty(); });
+$("usebat-cb").addEventListener("change", () => { readCurveInputs(); markDirty(); });
+$("btn-curve-save").addEventListener("click", saveCurve);
+$("btn-curve-reload").addEventListener("click", () => { loadConfig(); toast("↺ Changes discarded"); });
+$("btn-curve-default").addEventListener("click", () => {
+  draft[activeCurve] = activeCurve === "curve"
+    ? [{temp:0,level:"auto"},{temp:50,level:"4"},{temp:60,level:"6"},{temp:70,level:"7"},{temp:80,level:"disengaged"}]
+    : [{temp:0,level:"auto"},{temp:60,level:"3"},{temp:70,level:"5"},{temp:80,level:"7"},{temp:87,level:"disengaged"}];
+  renderCurve();
+  toast("⟲ Defaults loaded — press Save to apply");
+});
+
+/* Keyboard: 0–7 pick a level, A firmware auto, M max, D toggle the daemon. */
+document.addEventListener("keydown", e => {
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  if (/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
+  const k = e.key.toLowerCase();
+  if (k >= "0" && k <= "7") setFan(k);
+  else if (k === "a") setFan("auto");
+  else if (k === "m") setFan("disengaged");
+  else if (k === "d") toggleDaemon(!$("daemon-cb").checked);
+  else return;
+  e.preventDefault();
+});
+
+let resizeTimer;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(drawChart, 120);
+});
+
+/* ── init ── */
+loadConfig();
+refresh();
+refreshLog();
+setInterval(refresh, 3000);
+setInterval(refreshLog, 6000);
+</script>
+</body>
+</html>

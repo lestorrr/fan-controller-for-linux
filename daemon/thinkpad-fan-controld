@@ -1,0 +1,2667 @@
+#!/usr/bin/env python3
+"""
+ThinkPad fan control daemon, v2.
+
+Samples the thermal sensors once per second, filters them with two EMAs
+(a fast one for the rising path, a slow one for the falling path), walks a
+fan curve whose steps carry their own release temperatures, and drives
+/proc/acpi/ibm/fan.  It publishes its decision state for the GUI
+(state.json / history.json), answers a small control socket (manual holds),
+plays the critical alert as the desktop user without sudo, and keeps the
+EC watchdog fed so a dead daemon hands the fan back to the firmware.
+
+docs/CONTRACT.md is the binding specification; "§n" in comments refers to
+its sections.  Where the contract left room, the safer behaviour for the
+hardware was chosen and the reason is written next to the code.
+
+Self-contained on purpose: this runs as root, so it imports nothing from a
+user-writable directory (Python 3.12 stdlib only).
+
+Layout:
+  environment        paths, level table, GUI identity from daemon.env
+  config             DEFAULTS, sanitize(), v1 migration, --save-config
+  logging            dense log lines, WARN/ERROR rate limiting
+  hardware           hwmon by name, /proc/acpi/ibm/fan, AC, sd_notify, alerts
+  Controller         the decision logic; drives an injected HAL and clock
+  live daemon        selectors loop, control socket, state/history files,
+                     startup wait, self-test
+  simulation         fake clock/HAL, v1 rules, thermal model, --simulate
+  trace generator    --gen-trace scenarios
+  CLI
+"""
+
+import argparse
+import collections
+import copy
+import csv
+import glob
+import json
+import math
+import os
+import pwd
+import random
+import re
+import selectors
+import signal
+import socket
+import stat
+import statistics
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "2.0.0"
+
+# ── Environment ──────────────────────────────────────────────────────────────
+
+
+def _systemd_dir(var):
+    # systemd passes RUNTIME_DIRECTORY / STATE_DIRECTORY as a colon-separated
+    # list when a unit declares several directories; this unit declares one.
+    value = os.environ.get(var, "")
+    return value.split(":")[0] or None
+
+
+def _test_path(var, default):
+    """
+    FANCTL_* path overrides exist only so the offline test-suite can point the
+    daemon at scratch files.  A root process ignores them: the daemon under
+    systemd and --save-config under sudo always use the real paths, whatever
+    ends up in their environment.
+    """
+    if os.geteuid() != 0:
+        value = os.environ.get(var)
+        if value:
+            return value
+    return default
+
+
+CONFIG_FILE = _test_path("FANCTL_CONFIG_FILE", "/etc/thinkpad-fan-control/config.json")
+LOG_FILE = _test_path("FANCTL_LOG_FILE", "/var/log/thinkpad-fan-control.log")
+FAN_PROC = _test_path("FANCTL_FAN_PROC", "/proc/acpi/ibm/fan")
+HWMON_ROOT = _test_path("FANCTL_HWMON_ROOT", "/sys/class/hwmon")
+AC_ONLINE = _test_path("FANCTL_AC_ONLINE", "/sys/class/power_supply/AC/online")
+# Under systemd RUNTIME_DIRECTORY always wins; FANCTL_RUNTIME_DIR is for tests.
+RUN_DIR = (_systemd_dir("RUNTIME_DIRECTORY")
+           or _test_path("FANCTL_RUNTIME_DIR", "/run/thinkpad-fan-control"))
+STATE_DIR = (_systemd_dir("STATE_DIRECTORY")
+             or _test_path("FANCTL_STATE_DIR", "/var/lib/thinkpad-fan-control"))
+FALLBACK_WAV = "/usr/local/share/thinkpad-fan-control/alert.wav"
+
+LEVELS = ("auto", "0", "1", "2", "3", "4", "5", "6", "7", "disengaged", "full-speed")
+VALID_LEVELS = frozenset(LEVELS)
+# §3: airflow order.  Used to check a curve for monotony and to compare an
+# override with what the curve wants.
+RANK = {"auto": -1, "disengaged": 8, "full-speed": 8, **{str(i): i for i in range(8)}}
+
+HISTORY_SAMPLES = 1800          # 30 min at 1 Hz (§6)
+HISTORY_EVENTS = 200
+HISTORY_WRITE_S = 10
+RPM_LEARN_AFTER_S = 20          # §4.11
+RPM_SAMPLES = 50
+RPM_PERSIST_DELTA = 50
+EXTERNAL_WRITE_FLAG_S = 60      # §4.9
+TOP_CYCLE_WINDOW_S = 600        # §4.13
+SUSPEND_MIN_S = 30              # §4.7 amended: minimum suspension before resume
+FAN_OFF_MAX_TEMP = 55           # §7: level 0 refused at or above this raw temp
+SOCKET_MAX_REQUEST = 4096
+SOCKET_TIMEOUT_S = 0.5
+SAVE_CONFIG_MAX_BYTES = 65536
+TEST_ALERT_MIN_GAP_S = 10
+ALERT_CHILD_TIMEOUT_S = 30
+ALERT_FALLBACK_WINDOW_S = 2
+HARDWARE_WAIT_S = 60
+HARDWARE_WAIT_STEP_S = 2
+SD_WATCHDOG_PING_S = 10         # unit WatchdogSec=45; contract asks for <= 15 s
+MAX_TICK_FAILURES = 5           # consecutive crashed ticks before giving up
+
+
+def same_level(a, b):
+    """thinkpad_acpi reads `full-speed` back as `disengaged` (same EC bit)."""
+    return a == b or {a, b} <= {"disengaged", "full-speed"}
+
+
+class GuiIdentity:
+    """
+    Who the GUI runs as (§2).  It comes from daemon.env (root-owned, read via
+    EnvironmentFile=), never from the GUI-writable config.json, because it
+    decides who may talk to the socket and whose session hears the alert.
+    """
+
+    def __init__(self, environ=None):
+        env = os.environ if environ is None else environ
+        self.uid = _env_id(env.get("FANCTL_GUI_UID"), 1000)
+        self.gid = _env_id(env.get("FANCTL_GUI_GID"), 1000)
+        home = env.get("FANCTL_GUI_HOME") or ""
+        if not home.startswith("/"):
+            try:
+                home = "/home/" + pwd.getpwuid(self.uid).pw_name
+            except KeyError:
+                home = "/"
+        self.home = home
+        runtime = env.get("FANCTL_GUI_RUNTIME_DIR") or ""
+        self.runtime_dir = runtime if runtime.startswith("/") else f"/run/user/{self.uid}"
+
+
+def _env_id(value, default):
+    try:
+        v = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return v if 0 <= v < 2 ** 31 else default
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+V1_DEFAULT_CURVE = [
+    {"temp": 0, "level": "auto"},
+    {"temp": 50, "level": "4"},
+    {"temp": 60, "level": "6"},
+    {"temp": 70, "level": "7"},
+    {"temp": 80, "level": "disengaged"},
+]
+V1_DEFAULT_BATTERY_CURVE = [
+    {"temp": 0, "level": "auto"},
+    {"temp": 60, "level": "3"},
+    {"temp": 70, "level": "5"},
+    {"temp": 80, "level": "7"},
+    {"temp": 87, "level": "disengaged"},
+]
+
+DEFAULTS = {
+    "schema": 2,
+    "sample_interval": 1,
+    "smoothing_up_s": 8,
+    "smoothing_down_s": 30,
+    "dwell_down_s": 45,
+    "step_down_spacing_s": 10,
+    "hysteresis": 6,
+    "critical_temp": 90,
+    "critical_exit_margin": 8,
+    "critical_exit_hold_s": 60,
+    "watchdog": 60,
+    "override_max_seconds": 7200,
+    "override_ceiling_temp": 82,          # critical_temp - 8, recomputed in sanitize()
+    # The top step releases at 72 instead of 80 - 6: under a ~15 W load the
+    # die settles near 84 C at level 7 (~4000 RPM) and near 70 C at
+    # disengaged (6400 RPM), so a 6 C band is a guaranteed limit cycle.
+    "curve": [
+        {"temp": 0, "level": "auto"},
+        {"temp": 50, "level": "4"},
+        {"temp": 60, "level": "6"},
+        {"temp": 70, "level": "7"},
+        {"temp": 80, "level": "disengaged", "down": 72},
+    ],
+    "battery_curve": [
+        {"temp": 0, "level": "auto"},
+        {"temp": 60, "level": "3"},
+        {"temp": 70, "level": "5"},
+        {"temp": 80, "level": "7"},
+        {"temp": 87, "level": "disengaged", "down": 78},
+    ],
+    "use_battery_curve": True,
+    "alerts_enabled": True,
+    "alert_sound": "/home/jhnlstrlclcn/Music/SYSTEM SOUND/90c.mp3",
+    "alert_cooldown": 300,
+}
+
+# Closed integer ranges (§3).  watchdog and override_ceiling_temp have rules
+# of their own and are resolved separately.
+INT_RANGES = {
+    "sample_interval": (1, 5),
+    "smoothing_up_s": (2, 30),
+    "smoothing_down_s": (5, 120),
+    "dwell_down_s": (0, 300),
+    "step_down_spacing_s": (0, 60),
+    "hysteresis": (0, 20),
+    "critical_temp": (70, 105),
+    "critical_exit_margin": (3, 20),
+    "critical_exit_hold_s": (10, 600),
+    "override_max_seconds": (60, 14400),
+    "alert_cooldown": (30, 3600),
+}
+BOOL_KEYS = ("use_battery_curve", "alerts_enabled")
+# Present in a payload but neither applied nor reported as rejected: `schema`
+# is written by the daemon itself, `poll_interval` is the v1 key the
+# migration drops by design.
+SILENT_KEYS = frozenset(("schema", "poll_interval"))
+
+
+def _as_int(value):
+    """Ints and integral floats (JSON 50.0) only; bools and strings are not numbers here."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer() and abs(value) < 1e9:
+        return int(value)
+    return None
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _ranged(lo, hi):
+    def check(value):
+        v = _as_int(value)
+        return v if v is not None and lo <= v <= hi else None
+    return check
+
+
+def _valid_watchdog(value):
+    v = _as_int(value)
+    return v if v is not None and (v == 0 or 15 <= v <= 120) else None
+
+
+def _valid_alert_sound(value):
+    # Absolute, bounded, no control characters: the string becomes an argv
+    # element of a media player running in the desktop session.
+    if (isinstance(value, str) and value.startswith("/") and len(value) <= 400
+            and not any(ord(ch) < 32 or ord(ch) == 127 for ch in value)):
+        return value
+    return None
+
+
+def valid_curve(raw):
+    """
+    Normalise a curve or return None when it breaks a hard rule (§3).
+
+    Any violation rejects the whole curve: accepting part of it could drop
+    exactly the step that keeps the machine cool.  Steps must already be in
+    order; steps[0].temp is forced to 0 because the base step always applies.
+    """
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 8:
+        return None
+    steps = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        temp = _as_int(item.get("temp"))
+        level = item.get("level")
+        if temp is None or not 0 <= temp <= 105:
+            return None
+        if not isinstance(level, str) or level not in VALID_LEVELS:
+            return None
+        step = {"temp": temp, "level": level}
+        if item.get("down") is not None:
+            down = _as_int(item["down"])
+            if down is None:
+                return None
+            step["down"] = down
+        steps.append(step)
+    steps[0]["temp"] = 0
+    # The base step is never released from (release_temp(0) is None), so a
+    # `down` there means nothing; it is dropped the same way its temperature
+    # is forced to 0 rather than failing the whole curve over a no-op field.
+    steps[0].pop("down", None)
+    for i, step in enumerate(steps):
+        if i > 0:
+            if step["temp"] <= steps[i - 1]["temp"]:
+                return None
+            if step["level"] == "auto":
+                return None
+            if RANK[step["level"]] < RANK[steps[i - 1]["level"]]:
+                return None
+        if step["temp"] >= 60 and RANK[step["level"]] < 1:
+            return None
+        if "down" in step:
+            # Exactly the §3 bound, so the dashboard's validator and this one
+            # agree.  A negative value is only reachable for a step below
+            # 20 C, which the die never leaves anyway; pinning it is harmless.
+            if not step["temp"] - 20 <= step["down"] <= step["temp"] - 1:
+                return None
+    return steps
+
+
+VALIDATORS = {key: _ranged(lo, hi) for key, (lo, hi) in INT_RANGES.items()}
+VALIDATORS.update({key: _as_bool for key in BOOL_KEYS})
+VALIDATORS.update({
+    "watchdog": _valid_watchdog,
+    "alert_sound": _valid_alert_sound,
+    "curve": valid_curve,
+    "battery_curve": valid_curve,
+})
+
+
+def sanitize(raw, base=None):
+    """
+    The only config validator that matters (§3).  Returns (config, rejected).
+
+    Precedence per key: a valid value in `raw`; else the value in `base` (the
+    config on disk / in force) when that is itself valid; else DEFAULTS.  An
+    out-of-range value is invalid, not clamped: a hostile or buggy write then
+    changes nothing, and the key is listed in `rejected` so the GUI can say so.
+    Unknown keys are dropped (and reported).
+    """
+    cfg = copy.deepcopy(DEFAULTS)
+    rejected = []
+    for source, report in ((base, False), (raw, True)):
+        if not isinstance(source, dict):
+            continue
+        for key, validator in VALIDATORS.items():
+            if key not in source:
+                continue
+            value = validator(source[key])
+            if value is None:
+                if report:
+                    rejected.append(key)
+            else:
+                cfg[key] = copy.deepcopy(value)
+
+    # override_ceiling_temp is only meaningful relative to the final
+    # critical_temp, so it is resolved last: raw, else base, else crit - 8
+    # (always inside 60..crit-1 because crit >= 70).
+    crit = cfg["critical_temp"]
+    ceiling = crit - 8
+    for source, report in ((base, False), (raw, True)):
+        if isinstance(source, dict) and "override_ceiling_temp" in source:
+            v = _as_int(source["override_ceiling_temp"])
+            if v is not None and 60 <= v <= crit - 1:
+                ceiling = v
+            elif report:
+                rejected.append("override_ceiling_temp")
+    cfg["override_ceiling_temp"] = ceiling
+
+    # An armed EC watchdog must outlive three missed samples plus the refresh
+    # slack, or the EC would drop to auto between two of our writes.
+    if cfg["watchdog"] > 0:
+        cfg["watchdog"] = max(cfg["watchdog"], 3 * cfg["sample_interval"] + 15)
+
+    cfg["schema"] = 2
+    if isinstance(raw, dict):
+        known = set(DEFAULTS) | SILENT_KEYS
+        rejected.extend(key for key in raw if key not in known)
+    out = []
+    for key in rejected:
+        if key not in out:
+            out.append(key)
+    return cfg, out
+
+
+def migrate_v1(raw, note=None):
+    """
+    v1 (no `schema`) -> v2 (§3).  Returns a new dict and never mutates `raw`.
+    `note(msg)` is called when the watchdog gets switched on, so the caller
+    can log that once.
+    """
+    out = {k: copy.deepcopy(v) for k, v in raw.items() if k != "poll_interval"}
+    if "watchdog" in out and _as_int(out["watchdog"]) == 0:
+        out["watchdog"] = 60
+        if note is not None:
+            note("watchdog enabled (60 s) by upgrade")
+    for key, old, new in (("curve", V1_DEFAULT_CURVE, DEFAULTS["curve"]),
+                          ("battery_curve", V1_DEFAULT_BATTERY_CURVE,
+                           DEFAULTS["battery_curve"])):
+        if out.get(key) == old:
+            out[key] = copy.deepcopy(new)
+    out["schema"] = 2
+    return out
+
+
+def curve_summary(curve):
+    """`0:auto 50:4 60:6 70:7 80/72:disengaged` (§10)."""
+    return " ".join(f"{s['temp']}/{s['down']}:{s['level']}" if "down" in s
+                    else f"{s['temp']}:{s['level']}" for s in curve)
+
+# ── end of section: config part 1 ──
+
+
+def _write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def write_file_atomic(path, data, mode=0o644, durable=False):
+    """
+    tmp + os.replace, with the mode set by fchmod (the unit runs with
+    UMask=0077, so the mode passed to open() alone would come out 0600).
+
+    The temporary name is unique (mkstemp, O_EXCL): --self-test may write into
+    /tmp, where a predictable name could be pre-created by another user.
+    `durable` adds the fsyncs a config file deserves; tmpfs state does not.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".",
+                               suffix=".tmp", dir=directory)
+    try:
+        try:
+            os.fchmod(fd, mode)
+            _write_all(fd, data)
+            if durable:
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if durable:
+        try:
+            dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+
+
+def write_json_atomic(path, obj, durable=False):
+    data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    write_file_atomic(path, data, 0o644, durable)
+
+
+def read_config_file(path=None):
+    """(raw dict | None, mtime | None, error | None) without validating."""
+    path = path or CONFIG_FILE
+    try:
+        with open(path, "rb") as f:
+            mtime = os.fstat(f.fileno()).st_mtime
+            data = f.read(1 << 20)
+    except FileNotFoundError:
+        return None, None, "missing"
+    except OSError as e:
+        return None, None, e.strerror or str(e)
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, mtime, f"invalid JSON: {e}"
+    if not isinstance(raw, dict):
+        return None, mtime, "not a JSON object"
+    return raw, mtime, None
+
+
+def config_from_disk(raw, base, note=None):
+    """On-disk document -> sanitized config; a v1 file is migrated first (§3)."""
+    if "schema" not in raw:
+        raw = migrate_v1(raw, note)
+    return sanitize(raw, base)[0]
+
+
+def load_config(log):
+    """
+    Startup load: (config, mtime, schema found on disk or None).  A missing or
+    broken file yields DEFAULTS; mid-run reloads keep the running config
+    instead (Controller._check_config).
+    """
+    raw, mtime, err = read_config_file()
+    if raw is None:
+        if err == "missing":
+            log.info(f"No {CONFIG_FILE}; using defaults")
+        else:
+            log.warn(f"WARN: {CONFIG_FILE}: {err}; using defaults")
+        return sanitize({})[0], mtime, None
+    schema = _as_int(raw.get("schema")) if "schema" in raw else 1
+    return config_from_disk(raw, None, log.once), mtime, schema
+
+
+def save_config_main(stdin=None, stdout=None, stderr=None):
+    """
+    `--save-config` (§3): stdin JSON -> config.json, then exactly one JSON line
+    `{"config": ..., "rejected": [...]}` on stdout (install.sh and fanlib parse
+    the last stdout line).  Exit 0 on success, 1 on bad input or write error.
+
+    Validation lives here rather than in the GUI so that the only code that can
+    write the config is the same root-owned code that consumes it.
+    """
+    stdin = stdin or sys.stdin.buffer
+    stdout = stdout or sys.stdout
+    stderr = stderr or sys.stderr
+    data = stdin.read(SAVE_CONFIG_MAX_BYTES + 1)
+    if len(data) > SAVE_CONFIG_MAX_BYTES:
+        stderr.write(f"input larger than {SAVE_CONFIG_MAX_BYTES} bytes\n")
+        return 1
+    try:
+        raw = json.loads(data.decode("utf-8") if isinstance(data, bytes) else data)
+    except (ValueError, UnicodeDecodeError) as e:
+        stderr.write(f"invalid JSON: {e}\n")
+        return 1
+    if not isinstance(raw, dict):
+        stderr.write("config must be a JSON object\n")
+        return 1
+
+    log = Log(LOG_FILE)
+    on_disk, _mtime, err = read_config_file()
+    if on_disk is None and err not in (None, "missing"):
+        # Unreadable file on disk: the payload is applied over DEFAULTS.
+        log.warn(f"WARN: {CONFIG_FILE}: {err}; saving over defaults")
+    base = config_from_disk(on_disk, None, log.once) if on_disk is not None else None
+    # §3 says the migration applies "whenever schema is missing".  A payload
+    # is treated as a v1 document when it lacks `schema` AND either carries
+    # the v1-only `poll_interval` (an old GUI still running during an upgrade)
+    # or the file on disk is not v2 yet (install.sh feeding the old file back
+    # through here).  A v2 GUI's partial update without `schema` is NOT
+    # migrated: turning its explicit `watchdog: 0` ("Off") into 60, or its
+    # deliberately chosen v1-shaped curve into the v2 default, would silently
+    # undo the user's choice.
+    if "schema" not in raw and ("poll_interval" in raw or on_disk is None
+                                or "schema" not in on_disk):
+        raw = migrate_v1(raw, log.once)
+    cfg, rejected = sanitize(raw, base)
+    try:
+        directory = os.path.dirname(CONFIG_FILE)
+        if not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+            os.chmod(directory, 0o755)     # the GUI reads config.json as the user
+        write_json_atomic(CONFIG_FILE, cfg, durable=True)
+    except OSError as e:
+        stderr.write(f"cannot write {CONFIG_FILE}: {e}\n")
+        return 1
+    log.info("Config updated from GUI")
+    stdout.write(json.dumps({"config": cfg, "rejected": rejected}, separators=(",", ":")) + "\n")
+    stdout.flush()
+    return 0
+
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+class Log:
+    """
+    `[YYYY-mm-dd HH:MM:SS] message`, one append per line (§10), so logrotate
+    can rename the file without signalling us.
+
+    warn() rate-limits identical text to once per 60 s and appends `(xN)`
+    (occurrences since the last written copy) when it is written again, so a
+    stuck sensor or a failing fan write cannot flood the file at 1 Hz.
+    once() writes a given text a single time per process.
+    """
+
+    RATE_LIMIT_S = 60
+
+    def __init__(self, path=None, clock=None, echo=None, collect=False):
+        self.path = path
+        self.clock = clock or SystemClock()
+        self.echo = echo
+        self.lines = [] if collect else None
+        self._recent = {}               # text -> [last_written_mono, suppressed]
+        self._once = set()
+
+    def _emit(self, msg):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.clock.time()))
+        line = f"[{stamp}] {msg}\n"
+        if self.lines is not None:
+            self.lines.append(line.rstrip("\n"))
+        if self.echo is not None:
+            self.echo.write(line)
+            self.echo.flush()
+        if self.path:
+            try:
+                self._append(line)
+            except OSError:
+                # Never stdout: --save-config's stdout carries exactly one JSON line.
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+    def _append(self, line):
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL, 0o644)
+            # Created by us under UMask=0077: make it readable for the GUI.
+            os.fchmod(fd, 0o644)
+        except FileExistsError:
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND)
+        with open(fd, "a", encoding="utf-8") as f:
+            f.write(line)
+
+    def info(self, msg):
+        self._emit(msg)
+
+    def once(self, msg):
+        if msg not in self._once:
+            self._once.add(msg)
+            self._emit(msg)
+
+    def warn(self, msg):
+        now = self.clock.monotonic()
+        entry = self._recent.get(msg)
+        if entry is not None and now - entry[0] < self.RATE_LIMIT_S:
+            entry[1] += 1
+            return
+        suffix = f" (x{entry[1] + 1})" if entry is not None and entry[1] else ""
+        self._recent[msg] = [now, 0]
+        if len(self._recent) > 256:
+            self._recent = {k: v for k, v in self._recent.items()
+                            if now - v[0] < self.RATE_LIMIT_S}
+        self._emit(msg + suffix)
+
+    error = warn
+
+
+class SystemClock:
+    monotonic = staticmethod(time.monotonic)
+    time = staticmethod(time.time)
+
+# ── end of section: config part 2 + logging ──
+
+
+# ── Hardware ─────────────────────────────────────────────────────────────────
+
+def read_text(path, limit=65536):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(limit).strip()
+    except OSError:
+        return None
+
+
+class Hwmon:
+    """Sensors are found by driver name: hwmonN numbering changes across boots."""
+
+    def __init__(self):
+        self._dirs = {}
+
+    def _scan(self):
+        found = {}
+        for d in sorted(glob.glob(os.path.join(HWMON_ROOT, "hwmon*"))):
+            name = read_text(os.path.join(d, "name"))
+            if name and name not in found:
+                found[name] = d
+        self._dirs = found
+
+    def dir(self, name):
+        d = self._dirs.get(name)
+        if d is None or read_text(os.path.join(d, "name")) != name:
+            self._scan()
+            d = self._dirs.get(name)
+        return d
+
+    def temp(self, name, attr="temp1_input"):
+        """Float degrees C (no integer truncation, §4) or None when invalid."""
+        d = self.dir(name)
+        if d is None:
+            return None
+        value = read_text(os.path.join(d, attr))
+        try:
+            c = int(value) / 1000.0
+        except (TypeError, ValueError):
+            return None
+        # A disconnected sensor reads 0; that must never look "cool".
+        return c if 0 < c < 150 else None
+
+
+_COMMANDS_LEVEL = re.compile(r"^commands:\s*level\b")
+
+
+def parse_fan_proc(text):
+    """
+    /proc/acpi/ibm/fan -> {status, speed, level, control_available}.
+
+    `status: disabled` is the EC fan-status byte reading 0, i.e. the fan is
+    stopped at level 0; it says nothing about whether we may control the fan.
+    Control is available exactly when thinkpad_acpi (fan_control=1) prints a
+    `commands:` line offering `level <level>` (§4.9 / §5 as amended).
+    """
+    out = {"status": None, "speed": None, "level": None, "control_available": False}
+    if not text:
+        return out
+    for line in text.splitlines():
+        if _COMMANDS_LEVEL.match(line):
+            out["control_available"] = True
+            continue
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if key == "status":
+            out["status"] = value or None
+        elif key == "level":
+            out["level"] = value or None
+        elif key == "speed":
+            try:
+                out["speed"] = int(value)
+            except ValueError:
+                pass
+    return out
+
+
+def sd_notify(message):
+    """Type=notify plumbing; a no-op outside systemd."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(message.encode("utf-8"), addr)
+    except OSError:
+        pass
+
+
+def readable_by(path, uid, gid):
+    """
+    Could a process with exactly (uid, gid) and no supplementary groups read
+    `path`?  That is the alert player's identity (§8: extra_groups=[]).  The
+    daemon itself is root, so os.access() would always say yes.
+    """
+    def allowed(st, bit_user, bit_group, bit_other):
+        if st.st_uid == uid:
+            return bool(st.st_mode & bit_user)
+        if st.st_gid == gid:
+            return bool(st.st_mode & bit_group)
+        return bool(st.st_mode & bit_other)
+
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+        if not stat.S_ISREG(st.st_mode) or not allowed(st, stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH):
+            return False
+        parent = os.path.dirname(real)
+        while True:
+            pst = os.stat(parent)
+            if not allowed(pst, stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH):
+                return False
+            if parent == "/":
+                return True
+            parent = os.path.dirname(parent)
+    except OSError:
+        return False
+
+
+class AlertPlayer:
+    """
+    §8: play the alert as the GUI user via Popen(user=, group=), no sudo.
+
+    Children are tracked from the main loop: a paplay that exits non-zero
+    within 2 s (cannot decode or cannot reach the sound server) is retried
+    with gst-play-1.0; if that fails too, the fallback wav is played with
+    paplay.  That last stage goes beyond §8 in the safe direction: a critical
+    alert that stays silent because a user's mp3 is broken is worse than the
+    wrong sound.  Players still running after 30 s are killed.  Failures go
+    through the rate-limited WARN path, so each appears once.
+    """
+
+    def __init__(self, gui, log, clock=None):
+        self.gui = gui
+        self.log = log
+        self.clock = clock or SystemClock()
+        self.children = []
+
+    def _env(self):
+        rt = self.gui.runtime_dir
+        return {"XDG_RUNTIME_DIR": rt, "PULSE_SERVER": f"unix:{rt}/pulse/native",
+                "PATH": "/usr/bin:/bin", "HOME": self.gui.home}
+
+    def _spawn(self, argv, path, stage):
+        try:
+            proc = subprocess.Popen(
+                argv, user=self.gui.uid, group=self.gui.gid, extra_groups=[],
+                cwd="/", env=self._env(), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True)
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            self.log.warn(f"WARN: cannot start alert player {argv[0]}: {e}")
+            return False
+        self.children.append({"proc": proc, "path": path, "stage": stage,
+                              "started": self.clock.monotonic()})
+        return True
+
+    def play(self, path):
+        if self.gui.uid == 0:
+            # Never run a media decoder as root, whatever daemon.env says.
+            self.log.warn("WARN: FANCTL_GUI_UID is 0; alert sound not played")
+            return
+        if not readable_by(path, self.gui.uid, self.gui.gid):
+            self.log.warn(f"WARN: alert sound {path} is not readable by uid "
+                          f"{self.gui.uid}; using {FALLBACK_WAV}")
+            path = FALLBACK_WAV
+        self._spawn(["paplay", path], path, "paplay")
+
+    def _next(self, child, age):
+        if child["stage"] == "paplay" and age <= ALERT_FALLBACK_WINDOW_S:
+            return ["gst-play-1.0", "--no-interactive", "--volume=1.0", child["path"]], \
+                child["path"], "gst-play-1.0"
+        if child["stage"] == "gst-play-1.0" and child["path"] != FALLBACK_WAV:
+            return ["paplay", FALLBACK_WAV], FALLBACK_WAV, "paplay (fallback wav)"
+        return None
+
+    def poll(self):
+        """Reap finished players, apply the fallback chain, kill stuck ones."""
+        now = self.clock.monotonic()
+        keep, retries = [], []
+        for child in self.children:
+            proc = child["proc"]
+            age = now - child["started"]
+            rc = proc.poll()
+            if rc is None:
+                if age > ALERT_CHILD_TIMEOUT_S:
+                    self.log.warn(f"WARN: alert player {child['stage']} still running "
+                                  f"after {ALERT_CHILD_TIMEOUT_S} s; killed")
+                    self._kill(proc)
+                else:
+                    keep.append(child)
+                continue
+            if rc == 0:
+                continue
+            nxt = self._next(child, age)
+            if nxt is None:
+                self.log.warn(f"WARN: alert player {child['stage']} failed "
+                              f"(exit {rc}) on {child['path']}")
+                continue
+            self.log.warn(f"WARN: alert player {child['stage']} failed (exit {rc}) "
+                          f"on {child['path']}; trying {nxt[2]}")
+            retries.append(nxt)
+        self.children = keep
+        for argv, path, stage in retries:
+            self._spawn(argv, path, stage)
+
+    @staticmethod
+    def _kill(proc):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)      # own session: pgid == pid
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def kill_all(self):
+        for child in self.children:
+            self._kill(child["proc"])
+        self.children = []
+
+
+class LiveHAL:
+    """The real hardware behind the Controller's interface."""
+
+    def __init__(self, log, alert_player=None):
+        self.log = log
+        self.alert_player = alert_player
+        self.hwmon = Hwmon()
+
+    def read_temps(self):
+        return self.hwmon.temp("k10temp"), self.hwmon.temp("amdgpu")
+
+    def read_ac(self):
+        return read_text(AC_ONLINE) != "0"      # missing node -> AC (§4.3)
+
+    def fan_write(self, command):
+        """Every write is checked (§11): a sandbox that made /proc read-only must show."""
+        data = command.encode("ascii")
+        try:
+            # O_TRUNC matches what v1's open(path, "w") and the shell's `>`
+            # have always done on this procfs file; no O_CREAT, ever.
+            fd = os.open(FAN_PROC, os.O_WRONLY | os.O_TRUNC)
+            try:
+                n = os.write(fd, data)
+            finally:
+                os.close(fd)
+            if n != len(data):
+                raise OSError(f"short write ({n} of {len(data)} bytes)")
+            return True
+        except OSError as e:
+            self.log.error(f"ERROR: writing '{command}' to {FAN_PROC} failed: {e}")
+            return False
+
+    def fan_read(self):
+        return parse_fan_proc(read_text(FAN_PROC))
+
+    def play_alert(self, path):
+        if self.alert_player is not None:
+            self.alert_player.play(path)
+
+    def read_config(self):
+        return read_config_file()
+
+    def config_mtime(self):
+        try:
+            return os.stat(CONFIG_FILE).st_mtime
+        except OSError:
+            return None
+
+    def load_rpm(self):
+        try:
+            with open(os.path.join(STATE_DIR, "rpm.json"), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        out = {}
+        if isinstance(data, dict):
+            for level, rpm in data.items():
+                if level in VALID_LEVELS and _as_int(rpm) is not None and 0 <= rpm < 20000:
+                    out[level] = int(rpm)
+        return out
+
+    def save_rpm(self, rpm_by_level):
+        try:
+            write_json_atomic(os.path.join(STATE_DIR, "rpm.json"), rpm_by_level)
+        except OSError as e:
+            # Best effort (§4.11): a missing StateDirectory is not fatal.
+            self.log.warn(f"WARN: cannot persist rpm.json in {STATE_DIR}: {e}")
+
+# ── end of section: hardware ──
+
+
+# ── Controller ───────────────────────────────────────────────────────────────
+
+def _r1(value):
+    return None if value is None else round(value, 1)
+
+
+def _f1(value):
+    return "n/a" if value is None else f"{value:.1f}"
+
+
+def _error(code, message):
+    return {"ok": False, "error": code, "message": message}
+
+
+class Controller:
+    """
+    The decision logic of §4.  Everything it touches goes through `hal`
+    (sensors, fan, AC, config file, alerts, rpm store) and `clock`, so the live
+    daemon, --simulate and the unit tests all drive exactly this class.
+
+    Clocks: clock.monotonic() for dwell / spacing / hold / cooldown math,
+    clock.time() only for epoch fields (override.until, level_since, ts, log).
+    """
+
+    def __init__(self, cfg, hal, clock, log, *, cfg_mtime=None, cfg_schema=2,
+                 initial_level=None, rpm_by_level=None, pid=0, record=False):
+        self.cfg = cfg
+        self.hal = hal
+        self.clock = clock
+        self.log = log
+        self.pid = pid
+        now = clock.monotonic()
+        # sensors and filters
+        self.cpu = self.igpu = self.raw = None
+        self.t_fast = self.t_slow = None
+        self.missing = 0
+        self.sensor_lost = False
+        # power source (§4.3 debounce)
+        self.on_ac = True
+        self._ac_seen = False
+        self._ac_candidate = None
+        self._ac_count = 0
+        # curve position
+        self.idx = 0
+        self.last_up = now
+        self.last_change = now
+        self._tick_cause = None
+        self._was_top = None
+        self._top_entries = collections.deque()
+        # critical
+        self.critical = False
+        self.critical_since = None          # epoch, for state.json
+        self.critical_since_mono = None
+        self.crit_streak = 0
+        self.episode_alerts = 0
+        self.alerts_total = 0
+        self.last_alert_mono = None
+        self._test_alert_mono = None
+        # override (in memory only, §7)
+        self.override = None
+        # fan
+        self.level = initial_level          # last level successfully written
+        self.reason = "curve"
+        self.level_since = clock.time()
+        self.level_since_mono = now
+        self.last_write_mono = None
+        self.level_proc = None
+        self.rpm = None
+        self.fan_status = None
+        self.fan_control_available = False
+        self.external_until = None
+        self.watchdog_armed = None
+        # rpm learning (§4.11)
+        self.rpm_by_level = dict(rpm_by_level or {})
+        self._rpm_saved = dict(self.rpm_by_level)
+        self._rpm_samples = {}
+        # config reload bookkeeping (§4.4)
+        self.cfg_mtime = cfg_mtime
+        self.cfg_schema = cfg_schema
+        self._cfg_problem = None
+        # publication (§5 / §6)
+        self.samples = collections.deque(maxlen=HISTORY_SAMPLES)
+        self.events = collections.deque(maxlen=HISTORY_EVENTS)
+        self.history_dirty = False
+        self.state_dirty = False
+        # Transition records are for --simulate and tests only; the live
+        # daemon runs for weeks and must not grow a list per change.
+        self.record = record
+        self.transitions = []
+        self.ticks = 0
+
+    # ── small helpers ────────────────────────────────────────────────────
+
+    def dt(self):
+        return self.cfg["sample_interval"]
+
+    def curve_name(self):
+        return "battery" if (not self.on_ac and self.cfg["use_battery_curve"]) else "ac"
+
+    def curve(self):
+        return self.cfg["battery_curve" if self.curve_name() == "battery" else "curve"]
+
+    def release_temp(self, i):
+        """Release temperature of step i (§3): explicit `down`, else temp - hysteresis."""
+        if i <= 0:
+            return None
+        step = self.curve()[i]
+        if "down" in step:
+            return step["down"]
+        return max(0, step["temp"] - self.cfg["hysteresis"])
+
+    def curve_level(self):
+        curve = self.curve()
+        return curve[min(self.idx, len(curve) - 1)]["level"]
+
+    def effective_watchdog(self):
+        wd = self.cfg["watchdog"]
+        return 0 if wd == 0 else max(wd, 3 * self.dt() + 15)
+
+    def refresh_interval(self):
+        # §4.9: rewrite an unchanged level well inside the EC watchdog window.
+        wd = self.watchdog_armed if self.watchdog_armed is not None else self.effective_watchdog()
+        return min(20, wd // 3) if wd > 0 else 30
+
+    def event(self, kind, detail):
+        self.events.append([round(self.clock.time(), 3), kind, detail])
+        self.history_dirty = True
+
+    def _set_idx(self, idx, cause):
+        self.idx = idx
+        self._tick_cause = cause
+
+    def _reseat(self, now, cause):
+        """
+        §4.6 reseat(): the highest step whose threshold T_fast has reached,
+        dwell clocks restarted.  Never touches the EMAs.
+        """
+        if self.t_fast is None:
+            return
+        curve = self.curve()
+        self._set_idx(max(i for i, s in enumerate(curve) if s["temp"] <= self.t_fast), cause)
+        self.last_up = now
+        self.last_change = now
+
+    def _step_text(self):
+        curve = self.curve()
+        n = len(curve)
+        return f"step {min(self.idx, n - 1)}/{n} {self.curve_name()}"
+
+    # ── lifecycle ────────────────────────────────────────────────────────
+
+    def start(self):
+        cfg = self.cfg
+        wd = self.effective_watchdog()
+        battery = curve_summary(cfg["battery_curve"])
+        if not cfg["use_battery_curve"]:
+            battery += " (unused)"
+        self.log.info(
+            f"Daemon v{VERSION} started (pid {self.pid}, sample {cfg['sample_interval']} s, "
+            f"watchdog {str(wd) + ' s' if wd else 'off'}, critical {cfg['critical_temp']}, "
+            f"ac {curve_summary(cfg['curve'])} | battery {battery})")
+        self.event("daemon_start", f"v{VERSION}")
+        self._arm_watchdog()
+
+    def shutdown(self):
+        """Hand the fan back to the firmware; the watchdog goes first (§4)."""
+        self.log.info("Daemon stopping — returning fan to firmware control")
+        self.hal.fan_write("watchdog 0")
+        self.hal.fan_write("level auto")
+
+    def prime(self):
+        """
+        --self-test: seed the filters and the curve position from one sample and
+        read /proc, commanding nothing, so the published state shows what the
+        daemon would do without touching the fan beyond the write-back.
+        """
+        now = self.clock.monotonic()
+        self._read_temps()
+        if self.raw is not None:
+            self._update_power(now, initial=True)
+            self.t_fast = self.t_slow = self.raw
+            self._reseat(now, "start")
+        self._observe_proc()
+
+    # ── the tick ─────────────────────────────────────────────────────────
+
+    def _read_temps(self):
+        cpu, igpu = self.hal.read_temps()
+        self.cpu = cpu if cpu is not None and 0 < cpu < 150 else None
+        self.igpu = igpu if igpu is not None and 0 < igpu < 150 else None
+        valid = [v for v in (self.cpu, self.igpu) if v is not None]
+        self.raw = max(valid) if valid else None
+
+    def tick(self):
+        now = self.clock.monotonic()
+        self.ticks += 1
+        self._tick_cause = None
+        self._read_temps()
+        if self.raw is None:
+            self._tick_without_sensor(now)            # §4.1
+        else:
+            self._tick_with_sensor(now)
+        self._arm_watchdog()                          # §4.10
+        self._check_proc(now)                         # §4.9
+        self._learn_rpm(now)                          # §4.11
+        self._track_top(now)                          # §4.13
+        self.samples.append([round(self.clock.time(), 3), _r1(self.raw), _r1(self.t_fast),
+                             _r1(self.t_slow), self.level, self.rpm, self.on_ac])
+
+    def _tick_without_sensor(self, now):
+        self.missing += 1
+        self.crit_streak = 0               # a gap breaks "two consecutive samples"
+        if not self.sensor_lost and self.missing >= 3:
+            self.sensor_lost = True
+            target = "disengaged" if self.critical else "auto"
+            self.log.info(f"WARN: no valid temperature for {self.missing} samples; "
+                          f"fan -> {target} until a sensor returns")
+            self.event("sensor_lost", target)
+        self._expire_override(now)
+        if self.sensor_lost:
+            # Guessing is the one dangerous thing here: firmware auto is safe,
+            # and disengaged is the only safe answer during a critical episode.
+            self._command("disengaged" if self.critical else "auto", "sensor_lost", now)
+        elif self.level is not None:
+            self._command(self.level, self.reason, now)   # keeps the watchdog fed
+
+    def _tick_with_sensor(self, now):
+        raw = self.raw
+        if self.sensor_lost:                           # §4.1 recovery
+            # Checked first: a loss that started before the first valid
+            # sample (t_fast still None) is a recovery too, so it is logged
+            # and sensor_lost is cleared on this very tick.
+            first = self.t_fast is None
+            self.sensor_lost = False
+            self.missing = 0
+            self._update_power(now, initial=first)
+            self.t_fast = self.t_slow = raw
+            self._reseat(now, "sensor_ok")
+            self.log.info(f"Temperature sensors back (raw {raw:.1f}); re-seated at {self._step_text()}")
+            self.event("sensor_ok", f"raw {raw:.1f}")
+        elif self.t_fast is None:                      # first valid sample
+            self._update_power(now, initial=True)      # the right curve for the seat
+            self.t_fast = self.t_slow = raw
+            self.missing = 0
+            self._reseat(now, "start")
+        else:                                          # §4.2 filters
+            self.missing = 0
+            dt = self.dt()
+            a_up = 1.0 - math.exp(-dt / self.cfg["smoothing_up_s"])
+            a_dn = 1.0 - math.exp(-dt / self.cfg["smoothing_down_s"])
+            self.t_fast += a_up * (raw - self.t_fast)
+            self.t_slow += a_dn * (raw - self.t_slow)
+            self._update_power(now)                    # §4.3
+        self._check_config(now)                        # §4.4
+        self._critical(now)                            # §4.5
+        self._evaluate_curve(now)                      # §4.6
+        # §4.8 runs before §4.7's selection: a target taken from an override
+        # that expires in this same tick would put a stale level on the fan.
+        self._expire_override(now)
+        self._update_suspension(now)                   # §4.7
+        level, reason = self._select_target()
+        self._command(level, reason, now)              # §4.9
+
+    def _update_power(self, now, initial=False):
+        ac = bool(self.hal.read_ac())
+        if initial or not self._ac_seen:
+            self._ac_seen = True
+            self.on_ac = ac
+            self._ac_candidate, self._ac_count = None, 0
+            return
+        if ac == self.on_ac:
+            self._ac_candidate, self._ac_count = None, 0
+            return
+        if ac == self._ac_candidate:
+            self._ac_count += 1
+        else:
+            self._ac_candidate, self._ac_count = ac, 1
+        # The sysfs node bounces when the plug is wiggled: three identical
+        # readings before anything switches.
+        if self._ac_count < 3:
+            return
+        old_curve = self.curve_name()
+        self.on_ac = ac
+        self._ac_candidate, self._ac_count = None, 0
+        self.log.info(f"Power -> {'AC' if ac else 'battery'}")
+        self.event("ac", "AC" if ac else "battery")
+        # Re-seat only when the curve in use actually changed: with
+        # use_battery_curve off a plug event must not move the fan.
+        if self.curve_name() != old_curve:
+            self._reseat(now, "ac")
+
+    def _check_config(self, now):
+        mtime = self.hal.config_mtime()
+        if mtime == self.cfg_mtime:
+            return
+        if mtime is None:
+            if self._cfg_problem != "missing":
+                self._cfg_problem = "missing"
+                self.log.info("WARN: config file disappeared; keeping the running config")
+            self.cfg_mtime = None
+            return
+        raw, read_mtime, err = self.hal.read_config()
+        self.cfg_mtime = read_mtime if read_mtime is not None else mtime
+        if raw is None:
+            problem = (self.cfg_mtime, err)
+            if self._cfg_problem != problem:
+                self._cfg_problem = problem
+                self.log.info(f"WARN: config reload failed ({err}); keeping the running config")
+            return
+        self._cfg_problem = None
+        self.cfg_schema = _as_int(raw.get("schema")) if "schema" in raw else 1
+        new = config_from_disk(raw, self.cfg, self.log.once)
+        if new == self.cfg:
+            return
+        self.cfg = new
+        self.log.info(f"Config reloaded (sample {new['sample_interval']} s, watchdog "
+                      f"{new['watchdog'] or 'off'}, critical {new['critical_temp']}, "
+                      f"ac {curve_summary(new['curve'])} | battery {curve_summary(new['battery_curve'])})")
+        self.event("config", "reloaded")
+        self._reseat(now, "config")
+        self.state_dirty = True
+
+    def _critical(self, now):
+        cfg = self.cfg
+        crit = cfg["critical_temp"]
+        raw = self.raw
+        self.crit_streak = self.crit_streak + 1 if raw >= crit else 0
+        if not self.critical:
+            # Entry stays on raw samples, never on an EMA: two consecutive hits
+            # filter the 1 s Tctl spikes, +3 once catches a genuine runaway.
+            if self.crit_streak >= 2 or raw >= crit + 3:
+                self.critical = True
+                self.critical_since = self.clock.time()
+                self.critical_since_mono = now
+                self.episode_alerts = 0
+                self.log.info(f"CRITICAL entered (raw {raw:.1f} fast {self.t_fast:.1f} "
+                              f"slow {self.t_slow:.1f})")
+                self.event("critical_on", f"raw {raw:.1f}")
+                self.state_dirty = True
+                self._maybe_alert(now)
+            return
+        if (self.t_slow < crit - cfg["critical_exit_margin"]
+                and now - self.critical_since_mono >= cfg["critical_exit_hold_s"]):
+            # Amended §4.5: leave onto the TOP step with fresh dwell clocks and
+            # let the normal DOWN rules walk it down.  reseat() by T_fast here
+            # dropped straight to level 7, re-heated and re-entered critical.
+            self.critical = False
+            self.critical_since = None
+            self.critical_since_mono = None
+            n = len(self.curve())
+            self._set_idx(n - 1, "critical_exit")
+            self.last_up = now
+            self.last_change = now
+            # Two decimals and the limit: at one decimal a slow EMA of 81.96
+            # prints as "82.0" and the line would seem to contradict the rule.
+            self.log.info(f"CRITICAL cleared (slow {self.t_slow:.2f} < "
+                          f"{crit - cfg['critical_exit_margin']}) -> top step ({self._step_text()})")
+            self.event("critical_off", f"slow {self.t_slow:.1f}")
+            self.state_dirty = True
+            return
+        self._maybe_alert(now)
+
+    def _maybe_alert(self, now):
+        cfg = self.cfg
+        if not cfg["alerts_enabled"]:
+            return
+        if self.last_alert_mono is not None and now - self.last_alert_mono < cfg["alert_cooldown"]:
+            return
+        self.last_alert_mono = now
+        self.episode_alerts += 1
+        self.alerts_total += 1
+        self.hal.play_alert(cfg["alert_sound"])
+        since = time.strftime("%H:%M:%S", time.localtime(self.critical_since))
+        # Never "raw X at or above critical": on a repeat alert the current
+        # raw may already be below the threshold (amended §4.5).
+        self.log.info(f"ALERT: critical since {since} (raw {self.raw:.1f}, slow {self.t_slow:.1f})")
+        self.event("alert", f"raw {self.raw:.1f}")
+
+# ── end of section: controller part 1 ──
+
+    # ── Controller, part 2: curve, override, fan ─────────────────────────
+
+    def _evaluate_curve(self, now):
+        """
+        §4.6: always evaluated, even while critical or an override commands the
+        fan, so curve_level is always "what the curve would do".  One UP step
+        per tick on T_fast; DOWN on T_slow, gated by dwell since the last UP
+        and spacing since the last change.
+        """
+        cfg = self.cfg
+        curve = self.curve()
+        n = len(curve)
+        if self.idx >= n:
+            self._set_idx(n - 1, "clamp")
+        if self.idx + 1 < n and self.t_fast >= curve[self.idx + 1]["temp"]:
+            self._set_idx(self.idx + 1, "up")
+            self.last_up = now
+            self.last_change = now
+        elif (self.idx > 0 and self.t_slow < self.release_temp(self.idx)
+              and now - self.last_up >= cfg["dwell_down_s"]
+              and now - self.last_change >= cfg["step_down_spacing_s"]):
+            self._set_idx(self.idx - 1, "down")
+            self.last_change = now
+
+    def _expire_override(self, now):
+        ov = self.override
+        if ov is not None and ov["until"] <= self.clock.time():
+            self.override = None
+            self.log.info(f"Override {ov['level']} ended (expired)")
+            self.event("override_end", f"{ov['level']} expired")
+            self._reseat(now, "override_end")
+            self.state_dirty = True
+
+    def _update_suspension(self, now):
+        """
+        Amended §4.7 envelope: suspend on T_fast (a single Tctl spike on raw
+        flapped 3 -> disengaged -> 3 within 2 s in simulation), resume on
+        T_slow below ceiling - hysteresis and only after 30 s suspended.
+
+        Evaluated every tick an override exists, critical included: an
+        override left unsuspended through a critical episode would put the
+        low level back on the fan the moment critical clears, which is the
+        re-heating cycle the envelope exists to prevent.
+        """
+        ov = self.override
+        if ov is None or ov["level"] == "auto" or self.t_fast is None:
+            return
+        cfg = self.cfg
+        ceiling = cfg["override_ceiling_temp"]
+        if not ov["suspended"]:
+            wanted = self.curve_level()
+            if self.t_fast >= ceiling and RANK[wanted] > RANK[ov["level"]]:
+                ov["suspended"] = True
+                ov["suspended_at"] = now
+                self.log.info(f"Override {ov['level']} suspended (fast {self.t_fast:.1f} >= "
+                              f"ceiling {ceiling}; curve wants {wanted})")
+                self.state_dirty = True
+        elif (self.t_slow < ceiling - cfg["hysteresis"]
+              and now - ov["suspended_at"] >= SUSPEND_MIN_S):
+            ov["suspended"] = False
+            ov["suspended_at"] = None
+            self.log.info(f"Override {ov['level']} resumed (slow {self.t_slow:.2f} < "
+                          f"{ceiling - cfg['hysteresis']})")
+            self.state_dirty = True
+
+    def _select_target(self):
+        """§4.7: first match wins."""
+        if self.critical:
+            return "disengaged", "critical"
+        ov = self.override
+        if ov is not None:
+            if not ov["suspended"]:
+                return ov["level"], "override"
+            return self.curve_level(), "override_suspended_hot"
+        return self.curve_level(), "curve"
+
+    def _command(self, level, reason, now):
+        """
+        §4.9 Fan.set(): write on a change, or when the refresh interval has
+        elapsed (which also feeds the EC watchdog).  Refreshes are not logged.
+        A failed write leaves the commanded level unchanged, so it is retried
+        on the next tick; the HAL logs the failure (rate-limited).
+        """
+        self.reason = reason
+        changed = level != self.level
+        due = self.last_write_mono is None or now - self.last_write_mono >= self.refresh_interval()
+        if not (changed or due):
+            return
+        if not self.hal.fan_write(f"level {level}"):
+            return
+        self.last_write_mono = now
+        if not changed:
+            return
+        old = self.level
+        self.level = level
+        self.level_since = self.clock.time()
+        self.level_since_mono = now
+        self.log.info(self._change_line(old, level, reason))
+        self.event("level", f"{old if old is not None else '?'}->{level}")
+        self.state_dirty = True
+        if self.record:
+            self.transitions.append({
+                "t": now, "from": old, "to": level, "reason": reason,
+                "cause": self._tick_cause or reason, "raw": _r1(self.raw),
+                "fast": _r1(self.t_fast), "slow": _r1(self.t_slow),
+                "idx": self.idx, "curve": self.curve_name()})
+
+    def _change_line(self, old, new, reason):
+        """Dense §10 format, e.g. `Fan 7 -> disengaged (raw 81.2 fast 80.1 slow 77.9 |
+        step 4/5 ac | up>=80 down<72) [curve]`."""
+        curve = self.curve()
+        n = len(curve)
+        i = min(self.idx, n - 1)
+        if i > 0:
+            thresholds = f"up>={curve[i]['temp']} down<{self.release_temp(i)}"
+        elif n > 1:
+            thresholds = f"next>={curve[1]['temp']}"
+        else:
+            thresholds = "single step"
+        return (f"Fan {old if old is not None else '?'} -> {new} (raw {_f1(self.raw)} "
+                f"fast {_f1(self.t_fast)} slow {_f1(self.t_slow)} | {self._step_text()} | "
+                f"{thresholds}) [{reason}]")
+
+    def _arm_watchdog(self):
+        """§4.10: write `watchdog n` at start and whenever the effective value changes."""
+        n = self.effective_watchdog()
+        if n == self.watchdog_armed:
+            return
+        if self.hal.fan_write(f"watchdog {n}"):
+            previous = self.watchdog_armed
+            self.watchdog_armed = n
+            if previous is not None:          # the startup line already says it
+                self.log.info(f"EC watchdog set to {n} s" if n else "EC watchdog disabled")
+
+    def _observe_proc(self):
+        info = self.hal.fan_read() or {}
+        self.level_proc = info.get("level")
+        self.rpm = info.get("speed")
+        self.fan_status = info.get("status")
+        self.fan_control_available = bool(info.get("control_available"))
+        return info
+
+    def _check_proc(self, now):
+        """
+        §4.9: compare what the EC reports with what we commanded.  `auto` is
+        what a watchdog revert reads, so only other mismatches count as an
+        external write (logged once per 60 s episode); either way our level
+        is written again.
+        """
+        self._observe_proc()
+        if self.external_until is not None and now >= self.external_until:
+            self.external_until = None
+        if self.level is None or self.level_proc is None or same_level(self.level_proc, self.level):
+            return
+        if self.level_proc != "auto":
+            if self.external_until is None:
+                self.log.info(f"external fan write detected (level {self.level_proc})")
+            self.external_until = now + EXTERNAL_WRITE_FLAG_S
+            self.state_dirty = True
+        if self.hal.fan_write(f"level {self.level}"):
+            self.last_write_mono = now
+
+    def _learn_rpm(self, now):
+        """§4.11: median EC speed per level, after >= 20 s at that level."""
+        level = self.level
+        if (level in (None, "auto") or self.rpm is None or self.external_until is not None
+                or self.level_proc is None or not same_level(self.level_proc, level)
+                or now - self.level_since_mono < RPM_LEARN_AFTER_S):
+            return
+        samples = self._rpm_samples.setdefault(level, collections.deque(maxlen=RPM_SAMPLES))
+        samples.append(self.rpm)
+        median = int(round(statistics.median(samples)))
+        self.rpm_by_level[level] = median
+        saved = self._rpm_saved.get(level)
+        if saved is None or abs(median - saved) >= RPM_PERSIST_DELTA:
+            self._rpm_saved[level] = median
+            self.hal.save_rpm(dict(self.rpm_by_level))
+
+    def _track_top(self, now):
+        """§4.13: entries into the last curve step (any cause) within 600 s."""
+        n = len(self.curve())
+        at_top = n > 1 and self.idx == n - 1
+        if at_top and self._was_top is False:
+            self._top_entries.append(now)
+        self._was_top = at_top
+        while self._top_entries and now - self._top_entries[0] > TOP_CYCLE_WINDOW_S:
+            self._top_entries.popleft()
+
+    # ── control socket commands (§7) ─────────────────────────────────────
+
+    def handle_request(self, data, uid):
+        try:
+            req = json.loads(data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else data)
+        except (ValueError, UnicodeDecodeError):
+            return _error("bad_request", "Request is not valid JSON.")
+        if not isinstance(req, dict):
+            return _error("bad_request", "Request must be a JSON object.")
+        cmd = req.get("cmd")
+        if cmd == "hold":
+            return self.cmd_hold(req.get("level"), req.get("seconds", 0), uid)
+        if cmd == "resume":
+            return self.cmd_resume(uid)
+        if cmd == "status":
+            return {"ok": True, "state": self.state()}
+        if cmd == "test_alert":
+            return self.cmd_test_alert(uid)
+        return _error("bad_request", "Unknown command; expected hold, resume, status or test_alert.")
+
+    def cmd_hold(self, level, seconds, uid):
+        if not isinstance(level, str) or level not in VALID_LEVELS:
+            return _error("bad_request", "Level must be one of: " + ", ".join(LEVELS) + ".")
+        secs = _as_int(seconds)
+        if secs is None or secs < 0:
+            return _error("bad_request", "Seconds must be a non-negative integer.")
+        now = self.clock.monotonic()
+        info = self._observe_proc()
+        if not info.get("control_available"):
+            # Only the missing `commands: level` line means this; `status:
+            # disabled` merely says the fan is currently stopped at level 0.
+            return _error("fan_control_unavailable",
+                          "thinkpad_acpi offers no fan level control (no 'commands: level' line "
+                          "in /proc/acpi/ibm/fan); load it with fan_control=1.")
+        if level == "0" and (self.raw is None or self.raw >= FAN_OFF_MAX_TEMP):
+            # Unknown temperature is treated as hot: fan-off needs proof it is cool.
+            return _error("too_hot_for_fan_off",
+                          f"Fan off is only allowed below {FAN_OFF_MAX_TEMP} °C "
+                          f"(now {_f1(self.raw)}).")
+        limit = self.cfg["override_max_seconds"]
+        secs = limit if secs == 0 else min(secs, limit)
+        wall = self.clock.time()
+        self.override = {"level": level, "until": wall + secs, "set_at": wall,
+                         "suspended": False, "suspended_at": None, "uid": uid}
+        self.log.info(f"Override {level} for {secs}s (uid {uid})")
+        self.event("override_start", f"{level} {secs}s")
+        self._apply_now(now)
+        return {"ok": True, "state": self.state()}
+
+    def cmd_resume(self, uid):
+        now = self.clock.monotonic()
+        ov = self.override
+        if ov is not None:
+            self.override = None
+            self.log.info(f"Override {ov['level']} ended (resumed by uid {uid})")
+            self.event("override_end", f"{ov['level']} resumed")
+        self._reseat(now, "resume")
+        self._apply_now(now)
+        return {"ok": True, "state": self.state()}
+
+    def cmd_test_alert(self, uid):
+        now = self.clock.monotonic()
+        if (self._test_alert_mono is not None
+                and now - self._test_alert_mono < TEST_ALERT_MIN_GAP_S):
+            return _error("rate_limited", f"One test alert per {TEST_ALERT_MIN_GAP_S} s.")
+        self._test_alert_mono = now
+        self.hal.play_alert(self.cfg["alert_sound"])
+        self.log.info(f"Test alert (uid {uid})")
+        return {"ok": True}
+
+    def _apply_now(self, now):
+        """Target selection + fan write outside the sample schedule (no EMA step)."""
+        self.state_dirty = True
+        if self.t_fast is None:
+            return
+        if self.sensor_lost:
+            self._command("disengaged" if self.critical else "auto", "sensor_lost", now)
+        else:
+            self._update_suspension(now)
+            level, reason = self._select_target()
+            self._command(level, reason, now)
+        self._check_proc(now)
+
+    # ── publication (§5 / §6) ────────────────────────────────────────────
+
+    def dwell_remaining(self, now):
+        if self.idx == 0:
+            return 0
+        wait = max(self.cfg["dwell_down_s"] - (now - self.last_up),
+                   self.cfg["step_down_spacing_s"] - (now - self.last_change), 0.0)
+        return int(math.ceil(wait))
+
+    def top_cycles_10min(self, now):
+        return sum(1 for t in self._top_entries if now - t <= TOP_CYCLE_WINDOW_S)
+
+    def state(self):
+        now = self.clock.monotonic()
+        wall = self.clock.time()
+        cfg = self.cfg
+        curve = self.curve()
+        n = len(curve)
+        i = min(self.idx, n - 1)
+        ov = None
+        if self.override is not None:
+            o = self.override
+            ov = {"level": o["level"], "until": o["until"], "set_at": o["set_at"],
+                  "remaining_s": max(0, int(math.ceil(o["until"] - wall))),
+                  "suspended": o["suspended"]}
+        return {
+            "schema": 1, "version": VERSION, "pid": self.pid,
+            "ts": wall, "mono": now, "sample_interval": cfg["sample_interval"],
+            "sensor_ok": self.raw is not None,
+            "temp_raw": _r1(self.raw), "temp_fast": _r1(self.t_fast), "temp_slow": _r1(self.t_slow),
+            "cpu": _r1(self.cpu), "igpu": _r1(self.igpu),
+            "level": self.level, "level_proc": self.level_proc, "rpm": self.rpm,
+            "fan_control_available": self.fan_control_available, "fan_status": self.fan_status,
+            "reason": self.reason, "on_ac": self.on_ac, "curve": self.curve_name(),
+            "step_index": i, "steps": n, "curve_level": curve[i]["level"],
+            "up_at": curve[i + 1]["temp"] if i + 1 < n else None,
+            "down_below": self.release_temp(i),
+            "level_since": self.level_since,
+            "dwell_remaining_s": self.dwell_remaining(now),
+            # alerts: alerts played in the current (or last) critical episode.
+            "critical": {"active": self.critical, "since": self.critical_since,
+                         "alerts": self.episode_alerts},
+            "override": ov,
+            "watchdog": (self.watchdog_armed if self.watchdog_armed is not None
+                         else self.effective_watchdog()),
+            "hysteresis": cfg["hysteresis"], "critical_temp": cfg["critical_temp"],
+            "config_mtime": self.cfg_mtime, "config_schema": self.cfg_schema,
+            "rpm_by_level": dict(self.rpm_by_level),
+            "top_cycles_10min": self.top_cycles_10min(now),
+            "external_write_detected": self.external_until is not None,
+        }
+
+    def history(self):
+        return {"schema": 1, "sample_interval": self.cfg["sample_interval"],
+                "samples": list(self.samples), "events": list(self.events)}
+
+# ── end of section: controller part 2 ──
+
+
+# ── Live daemon ──────────────────────────────────────────────────────────────
+
+class ControlServer:
+    """
+    §7 control socket.  Connections are handled inline in the selectors loop
+    (no threads): one request line in, one JSON line out, close.  The peer's
+    uid comes from SO_PEERCRED, i.e. from the kernel, not from the request.
+    """
+
+    def __init__(self, path, gui, ctrl, log):
+        self.path = path
+        self.gui = gui
+        self.ctrl = ctrl
+        self.log = log
+        self.sock = None
+
+    def open(self):
+        try:
+            os.unlink(self.path)             # stale socket from a crashed run
+        except FileNotFoundError:
+            pass
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(self.path)
+            if os.geteuid() == 0:
+                os.chown(self.path, 0, self.gui.gid)
+            os.chmod(self.path, 0o660)
+            sock.listen(4)
+            sock.setblocking(False)
+        except OSError:
+            sock.close()
+            raise
+        self.sock = sock
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+    def _read_line(self, conn):
+        """Up to 4096 bytes up to the first newline, within 0.5 s in total."""
+        deadline = time.monotonic() + SOCKET_TIMEOUT_S
+        buf = b""
+        while b"\n" not in buf:
+            if len(buf) >= SOCKET_MAX_REQUEST:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("request not completed in time")
+            conn.settimeout(remaining)
+            chunk = conn.recv(SOCKET_MAX_REQUEST - len(buf))
+            if not chunk:
+                return buf
+            buf += chunk
+        return buf.split(b"\n", 1)[0]
+
+    def handle(self):
+        """Serve one pending connection.  Returns True when a request was answered."""
+        try:
+            conn, _addr = self.sock.accept()
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError as e:
+            self.log.warn(f"WARN: control socket accept failed: {e}")
+            return False
+        with conn:
+            try:
+                conn.settimeout(SOCKET_TIMEOUT_S)
+                creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                        struct.calcsize("3i"))
+                _pid, uid, _gid = struct.unpack("3i", creds)
+                if uid not in (0, self.gui.uid):
+                    return False                 # §7: close silently
+                line = self._read_line(conn)
+                if line is None:
+                    reply = _error("bad_request", f"Request longer than {SOCKET_MAX_REQUEST} bytes.")
+                else:
+                    try:
+                        reply = self.ctrl.handle_request(line, uid)
+                    except Exception as e:
+                        # The socket is a convenience; the curve, critical
+                        # protection and the watchdog are not.  A bug in a
+                        # command handler must never end the control loop
+                        # (the caller of handle() does not catch).
+                        self.log.error(f"ERROR: control request failed: {type(e).__name__}: {e}")
+                        reply = _error("internal_error", "The daemon could not process the request; "
+                                       "see /var/log/thinkpad-fan-control.log.")
+                conn.sendall((json.dumps(reply, separators=(",", ":")) + "\n").encode("utf-8"))
+                return True
+            except (OSError, ValueError, struct.error):
+                return False                     # peer vanished / timed out / sent garbage
+            except Exception as e:
+                self.log.error(f"ERROR: control connection failed: {type(e).__name__}: {e}")
+                return False
+
+
+class LiveDaemon:
+    """The selectors loop: ticks on schedule, socket requests in between."""
+
+    def __init__(self, ctrl, log, run_dir, server=None, alert_player=None, clock=None):
+        self.ctrl = ctrl
+        self.log = log
+        self.run_dir = run_dir
+        self.server = server
+        self.alert_player = alert_player
+        self.clock = clock or SystemClock()
+        self.state_path = os.path.join(run_dir, "state.json")
+        self.history_path = os.path.join(run_dir, "history.json")
+        self._stop = False
+        self._wake_r, self._wake_w = os.pipe()
+        os.set_blocking(self._wake_r, False)
+        os.set_blocking(self._wake_w, False)
+
+    def request_stop(self, *_args):
+        """Signal handler and test hook: wakes the selector through a pipe."""
+        self._stop = True
+        try:
+            os.write(self._wake_w, b"x")
+        except OSError:
+            pass
+
+    def publish_state(self):
+        try:
+            write_json_atomic(self.state_path, self.ctrl.state())
+            self.ctrl.state_dirty = False
+        except OSError as e:
+            self.log.error(f"ERROR: cannot write {self.state_path}: {e}")
+
+    def publish_history(self):
+        try:
+            write_json_atomic(self.history_path, self.ctrl.history())
+            self.ctrl.history_dirty = False
+        except OSError as e:
+            self.log.error(f"ERROR: cannot write {self.history_path}: {e}")
+
+    def remove_files(self):
+        # The RuntimeDirectory disappears with the unit anyway; this also
+        # covers a manual run, so a stopped daemon never looks alive.
+        for path in (self.state_path, self.history_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def close(self):
+        for fd in (self._wake_r, self._wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def run(self):
+        """Returns the exit code: 0 on a requested stop, 1 after repeated tick failures."""
+        ctrl = self.ctrl
+        sel = selectors.DefaultSelector()
+        sel.register(self._wake_r, selectors.EVENT_READ, "wake")
+        if self.server is not None and self.server.sock is not None:
+            sel.register(self.server.sock, selectors.EVENT_READ, "sock")
+        now = self.clock.monotonic()
+        next_tick = now + ctrl.dt()
+        next_ping = now + SD_WATCHDOG_PING_S
+        last_history = now
+        failures = 0
+        try:
+            while not self._stop:
+                now = self.clock.monotonic()
+                timeout = max(0.0, min(next_tick, next_ping, last_history + HISTORY_WRITE_S) - now)
+                if self.alert_player is not None and self.alert_player.children:
+                    timeout = min(timeout, 0.5)
+                for key, _mask in sel.select(timeout):
+                    if key.data == "wake":
+                        try:
+                            os.read(self._wake_r, 512)
+                        except OSError:
+                            pass
+                    elif key.data == "sock" and self.server.handle():
+                        # §4.12: publish right after a hold / resume, so the
+                        # caller's next read of state.json is already true.
+                        if ctrl.state_dirty:
+                            self.publish_state()
+                        if ctrl.history_dirty:
+                            self.publish_history()
+                            last_history = self.clock.monotonic()
+                if self._stop:
+                    break
+                now = self.clock.monotonic()
+                if now >= next_tick:
+                    try:
+                        ctrl.tick()
+                        failures = 0
+                    except Exception as e:      # keep feeding systemd only while ticks work
+                        failures += 1
+                        self.log.error(f"ERROR: control tick failed: {type(e).__name__}: {e}")
+                        if failures >= MAX_TICK_FAILURES:
+                            self.log.info(f"FATAL: {failures} consecutive tick failures; exiting")
+                            return 1
+                    self.publish_state()
+                    next_tick += ctrl.dt()
+                    if next_tick <= now:        # fell behind: do not burst to catch up
+                        next_tick = now + ctrl.dt()
+                if ctrl.history_dirty or now - last_history >= HISTORY_WRITE_S:
+                    self.publish_history()
+                    last_history = now
+                if now >= next_ping:
+                    sd_notify("WATCHDOG=1")
+                    next_ping = now + SD_WATCHDOG_PING_S
+                if self.alert_player is not None:
+                    self.alert_player.poll()
+            return 0
+        finally:
+            sel.close()
+
+
+def _fake_paths_in_use():
+    return FAN_PROC != "/proc/acpi/ibm/fan"
+
+
+def wait_for_hardware(hal, log):
+    """Startup wait (§4): up to 60 s in 2 s steps for /proc and a readable sensor."""
+    deadline = time.monotonic() + HARDWARE_WAIT_S
+    announced = False
+    while True:
+        have_proc = os.path.exists(FAN_PROC)
+        cpu, igpu = hal.read_temps()
+        have_sensor = cpu is not None or igpu is not None
+        if have_proc and have_sensor:
+            return True
+        if time.monotonic() >= deadline:
+            missing = ([] if have_proc else [FAN_PROC]) + ([] if have_sensor else ["k10temp/amdgpu sensor"])
+            log.info(f"FATAL: {' and '.join(missing)} not available after {HARDWARE_WAIT_S} s")
+            return False
+        if not announced:
+            log.info(f"Waiting up to {HARDWARE_WAIT_S} s for {FAN_PROC} and a temperature sensor")
+            announced = True
+        time.sleep(HARDWARE_WAIT_STEP_S)
+
+
+def fan_self_test(hal, log):
+    """
+    §4 self-test: read the current level and write it back.  A sandbox that
+    made /proc/acpi/ibm/fan read-only, or thinkpad_acpi without fan_control=1,
+    fails here, loudly, instead of leaving a fan nobody controls.
+
+    Returns the level written back (what the EC holds as the daemon takes
+    over), or None on failure.
+    """
+    info = hal.fan_read()
+    level = info.get("level")
+    if level not in VALID_LEVELS:
+        log.info(f"FATAL: {FAN_PROC} reports level {level!r}; refusing to take over")
+        return None
+    if not hal.fan_write(f"level {level}"):
+        hint = ("" if info.get("control_available") else
+                " (no 'commands: level' line: is thinkpad_acpi loaded with fan_control=1?)")
+        log.info(f"FATAL: self-test write 'level {level}' to {FAN_PROC} failed{hint}")
+        return None
+    return level
+
+
+def _require_root(log):
+    # Only root can write the EC.  A non-root run is refused before any write
+    # is attempted, unless the test-suite pointed us at a fake /proc file.
+    if os.geteuid() != 0 and not _fake_paths_in_use():
+        log.info("FATAL: thinkpad-fan-controld must run as root (systemd unit)")
+        sys.stderr.write("thinkpad-fan-controld: must run as root\n")
+        return False
+    return True
+
+
+def run_daemon():
+    log = Log(LOG_FILE)
+    if not _require_root(log):
+        return 1
+    gui = GuiIdentity()
+    clock = SystemClock()
+    player = AlertPlayer(gui, log, clock)
+    hal = LiveHAL(log, player)
+    if not wait_for_hardware(hal, log):
+        return 1
+    level = fan_self_test(hal, log)
+    if level is None:
+        return 1
+    cfg, mtime, schema = load_config(log)
+    ctrl = Controller(cfg, hal, clock, log, cfg_mtime=mtime, cfg_schema=schema,
+                      initial_level=level, rpm_by_level=hal.load_rpm(), pid=os.getpid())
+    server = None
+    try:
+        os.makedirs(RUN_DIR, mode=0o755, exist_ok=True)
+        server = ControlServer(os.path.join(RUN_DIR, "control.sock"), gui, ctrl, log)
+        server.open()
+    except OSError as e:
+        # Curve, critical and watchdog still work without the socket, so
+        # this is loud but not fatal.
+        log.error(f"ERROR: control socket unavailable: {e}")
+        server = None
+    daemon = LiveDaemon(ctrl, log, RUN_DIR, server, player, clock)
+    signal.signal(signal.SIGTERM, daemon.request_stop)
+    signal.signal(signal.SIGINT, daemon.request_stop)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)   # the default action would skip cleanup
+    code = 1
+    try:
+        ctrl.start()
+        ctrl.tick()
+        daemon.publish_state()
+        daemon.publish_history()
+        sd_notify("READY=1")
+        code = daemon.run()
+    except Exception as e:
+        log.info(f"FATAL: {type(e).__name__}: {e}")
+        code = 1
+    finally:
+        sd_notify("STOPPING=1")
+        ctrl.shutdown()
+        player.kill_all()
+        if server is not None:
+            server.close()
+        daemon.remove_files()
+        daemon.close()
+    return code
+
+
+def self_test_main():
+    """
+    `--self-test` (§13): hardware wait, level write-back, one state.json in
+    $RUNTIME_DIRECTORY or /tmp.  Commands nothing else and never plays sound.
+    """
+    log = Log(LOG_FILE)
+    if not _require_root(log):
+        return 1
+    hal = LiveHAL(log, alert_player=None)
+    if not wait_for_hardware(hal, log):
+        return 1
+    level = fan_self_test(hal, log)
+    if level is None:
+        return 1
+    cfg, mtime, schema = load_config(log)
+    ctrl = Controller(cfg, hal, SystemClock(), log, cfg_mtime=mtime, cfg_schema=schema,
+                      initial_level=level, rpm_by_level=hal.load_rpm(), pid=os.getpid())
+    ctrl.prime()
+    path = os.path.join(_systemd_dir("RUNTIME_DIRECTORY") or "/tmp", "state.json")
+    try:
+        write_json_atomic(path, ctrl.state())
+    except OSError as e:
+        log.info(f"FATAL: self-test cannot write {path}: {e}")
+        return 1
+    msg = (f"Self-test OK (level {level} written back, rpm {ctrl.rpm}, raw {_f1(ctrl.raw)}, "
+           f"would use {ctrl.curve_level()} at {ctrl._step_text()}; state {path})")
+    log.info(msg)
+    sys.stdout.write(msg + "\n")
+    return 0
+
+# ── end of section: live daemon ──
+
+
+# ── Simulation ───────────────────────────────────────────────────────────────
+
+SIM_EPOCH_BASE = 1_790_000_000.0     # wall-clock origin for traces with relative time
+
+# First-order thermal model (§13): T' = (T_amb + P*R(level) - T) / (R(level)*C).
+MODEL_C = 50.0                        # J/K
+MODEL_T_AMB = 36.0                    # C
+MODEL_THM = 95.0                      # SMU THM limit: the die cannot run hotter
+# K/W.  auto, 3..7 and disengaged are the contract's values; 0..2 are not
+# given there and are extrapolated so a curve using them still simulates.
+MODEL_R = {"auto": 4.8, "0": 6.0, "1": 5.4, "2": 4.9, "3": 4.4, "4": 4.2, "5": 3.9,
+           "6": 3.5, "7": 3.2, "disengaged": 2.25, "full-speed": 2.25}
+# EC speed the fake fan reports.  7 and disengaged are measured on this unit;
+# the rest are estimates that only feed the rpm-learning code path.
+SIM_RPM = {"auto": 2600, "0": 0, "1": 1900, "2": 2300, "3": 2700, "4": 3000, "5": 3300,
+           "6": 3600, "7": 4000, "disengaged": 6400, "full-speed": 6400}
+
+
+def thermal_step(temp, power, level, dt):
+    """Exact solution for constant P and level over dt, then the THM clamp."""
+    r = MODEL_R.get(level, MODEL_R["auto"])
+    target = MODEL_T_AMB + power * r
+    return min(target + (temp - target) * math.exp(-dt / (r * MODEL_C)), MODEL_THM)
+
+
+class FakeClock:
+    def __init__(self, mono=0.0, epoch=SIM_EPOCH_BASE):
+        self._mono = mono
+        self._epoch = epoch
+
+    def monotonic(self):
+        return self._mono
+
+    def time(self):
+        return self._epoch
+
+    def set(self, mono, epoch):
+        self._mono, self._epoch = mono, epoch
+
+    def advance(self, seconds):
+        self._mono += seconds
+        self._epoch += seconds
+
+
+class SimHAL:
+    """
+    Fake hardware for --simulate and the unit tests.  Never touches /proc,
+    /run, /var or the sound system: writes and alerts are only recorded.
+    """
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.cpu = None
+        self.igpu = None
+        self.ac = True
+        self.level = "auto"               # what the fake EC holds
+        self.watchdog = 0
+        self.write_ok = True
+        self.control_available = True
+        self.writes = []
+        self.alerts = []
+        self.saved_rpm = None
+        self.cfg_mtime = None
+        self.cfg_raw = None
+        self.cfg_error = None
+
+    def read_temps(self):
+        return self.cpu, self.igpu
+
+    def read_ac(self):
+        return self.ac
+
+    def fan_write(self, command):
+        self.writes.append((self.clock.monotonic(), command))
+        if not self.write_ok:
+            return False
+        if command.startswith("level "):
+            self.level = command[6:]
+        elif command.startswith("watchdog "):
+            self.watchdog = int(command[9:])
+        return True
+
+    def fan_read(self):
+        level = "disengaged" if self.level == "full-speed" else self.level
+        return {"status": "disabled" if level == "0" else "enabled",
+                "speed": SIM_RPM.get(level, 0), "level": level,
+                "control_available": self.control_available}
+
+    def play_alert(self, path):
+        self.alerts.append((self.clock.monotonic(), path))
+
+    def config_mtime(self):
+        return self.cfg_mtime
+
+    def read_config(self):
+        return copy.deepcopy(self.cfg_raw), self.cfg_mtime, self.cfg_error
+
+    def load_rpm(self):
+        return {}
+
+    def save_rpm(self, rpm_by_level):
+        self.saved_rpm = dict(rpm_by_level)
+
+
+class LegacyController:
+    """
+    The v1 rules, for comparison only (`--set legacy=1`): 3 s poll, integer
+    temperatures, raw thresholds, 5 C hysteresis, critical on one raw sample,
+    v1 default curves.  Mirrors backup-2026-09-23-pre-v2/daemon's pick_step().
+    """
+
+    POLL_S = 3
+
+    def __init__(self, hal, clock, log):
+        self.hal = hal
+        self.clock = clock
+        self.log = log
+        self.cfg = {"sample_interval": self.POLL_S, "critical_temp": 90, "hysteresis": 5,
+                    "alert_cooldown": 300, "curve": V1_DEFAULT_CURVE,
+                    "battery_curve": V1_DEFAULT_BATTERY_CURVE}
+        self.idx = 0
+        self.level = "auto"
+        self.reason = "curve"
+        self.raw = self.t_fast = self.t_slow = None
+        self.on_ac = True
+        self._last_ac = None
+        self.critical = False
+        self.override = None
+        self.sensor_lost = False
+        self.alerts_total = 0
+        self._last_alert = None
+        self.record = True
+        self.transitions = []
+        self.events = collections.deque()
+
+    def dt(self):
+        return self.POLL_S
+
+    def curve_name(self):
+        return "ac" if self.on_ac else "battery"
+
+    def start(self):
+        pass
+
+    def tick(self):
+        now = self.clock.monotonic()
+        vals = [int(v) for v in self.hal.read_temps() if v is not None and 0 < v < 150]
+        self.raw = max(vals) if vals else None
+        self.t_fast = self.t_slow = self.raw
+        if self.raw is None:
+            self.sensor_lost = True
+            return self._set("auto", "sensor_lost", now)
+        self.sensor_lost = False
+        ac = self.hal.read_ac()
+        if ac != self._last_ac:
+            self._last_ac = ac
+            self.on_ac = ac
+            self.idx = 0
+        curve = self.cfg["curve"] if self.on_ac else self.cfg["battery_curve"]
+        if self.raw >= self.cfg["critical_temp"]:
+            self.critical = True
+            self.idx = len(curve) - 1
+            if self._last_alert is None or now - self._last_alert >= self.cfg["alert_cooldown"]:
+                self._last_alert = now
+                self.alerts_total += 1
+                self.hal.play_alert("legacy")
+            return self._set("disengaged", "critical", now)
+        self.critical = False
+        idx = max(0, min(self.idx, len(curve) - 1))
+        while idx + 1 < len(curve) and self.raw >= curve[idx + 1]["temp"]:
+            idx += 1
+        while idx > 0 and self.raw < curve[idx]["temp"] - self.cfg["hysteresis"]:
+            idx -= 1
+        self.idx = idx
+        self._set(curve[idx]["level"], "curve", now)
+
+    def _set(self, level, reason, now):
+        self.reason = reason
+        if level != self.level and self.hal.fan_write(f"level {level}"):
+            self.log.info(f"[v1] Fan {self.level} -> {level} (raw {self.raw})")
+            self.transitions.append({"t": now, "from": self.level, "to": level, "reason": reason,
+                                     "cause": reason, "raw": self.raw, "fast": None,
+                                     "slow": None, "idx": self.idx, "curve": self.curve_name()})
+            self.level = level
+
+
+def _truthy(value, default=True):
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _float_or_none(value):
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _pick(row, names):
+    for name in names:
+        value = row.get(name)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def load_trace(path):
+    """
+    Trace rows: {t, cpu, igpu, ac, sensor_ok, cpu_ok, p_w, spike, model, hold}.
+
+    CSV columns (§13): ts|t_s, cpu|tctl_c, igpu|gpu_c, ac, sensor_ok; extra
+    columns are ignored except the ones --gen-trace writes for a closed-loop
+    run: p_w (package power), spike_c (Tctl burst on top of the model
+    temperature), model_c (model temperature, used to start the loop),
+    cpu_ok (only the CPU sensor missing), hold_level / hold_seconds (a socket
+    hold issued at that second).  history.json samples are also accepted.
+    """
+    rows = []
+    if path.endswith(".json"):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        for s in data.get("samples", []):
+            if not isinstance(s, list) or len(s) < 7 or _float_or_none(s[0]) is None:
+                continue
+            raw = _float_or_none(s[1])
+            rows.append({"t": float(s[0]), "cpu": raw, "igpu": None, "ac": bool(s[6]),
+                         "sensor_ok": raw is not None, "cpu_ok": True, "p_w": None,
+                         "spike": 0.0, "model": None, "hold": None})
+        return rows
+    with open(path, encoding="utf-8", newline="") as f:
+        for raw in csv.DictReader(f):
+            t = _float_or_none(_pick(raw, ("ts", "t_s")))
+            if t is None:
+                continue
+            hold = None
+            if _pick(raw, ("hold_level",)):
+                hold = (raw["hold_level"].strip(),
+                        int(_float_or_none(_pick(raw, ("hold_seconds",))) or 0))
+            rows.append({
+                "t": t,
+                "cpu": _float_or_none(_pick(raw, ("cpu", "tctl_c"))),
+                "igpu": _float_or_none(_pick(raw, ("igpu", "gpu_c"))),
+                "ac": _truthy(raw.get("ac")),
+                "sensor_ok": _truthy(raw.get("sensor_ok")),
+                "cpu_ok": _truthy(raw.get("cpu_ok")),
+                "p_w": _float_or_none(raw.get("p_w")),
+                "spike": _float_or_none(raw.get("spike_c")) or 0.0,
+                "model": _float_or_none(raw.get("model_c")),
+                "hold": hold,
+            })
+    rows.sort(key=lambda r: r["t"])
+    return rows
+
+
+def simulate(rows, cfg, legacy=False, open_loop=False, echo=None, detail=False):
+    """
+    Run the exact decision code over a trace with a fake clock and a fake fan.
+
+    Closed loop (the trace carries p_w, as --gen-trace output does): the die
+    temperature follows the thermal model driven by the level the controller
+    actually commands, so a what-if config changes the temperatures too.
+    Open loop (recorded traces, or --open-loop): temperatures are replayed.
+    """
+    if not rows:
+        raise ValueError("empty trace")
+    t0 = rows[0]["t"]
+    epoch0 = t0 if t0 > 1e9 else SIM_EPOCH_BASE + t0
+    clock = FakeClock(0.0, epoch0)
+    hal = SimHAL(clock)
+    log = Log(None, clock, echo=echo, collect=detail)
+    closed = not open_loop and any(r["p_w"] is not None for r in rows)
+    if legacy:
+        ctrl = LegacyController(hal, clock, log)
+        cfg = dict(ctrl.cfg)
+    else:
+        ctrl = Controller(cfg, hal, clock, log, initial_level="auto", record=True)
+    first = rows[0]
+    temp = None
+    if closed:
+        temp = first["model"] if first["model"] is not None else (first["cpu"] or 45.0)
+    hal.ac = first["ac"]
+    ctrl.start()
+    ticks = []
+    next_tick = t0
+    prev_t, prev_p = t0, first["p_w"]
+    dt = ctrl.dt()
+    for row in rows:
+        t = row["t"]
+        if closed:
+            if t > prev_t and prev_p is not None:
+                temp = thermal_step(temp, prev_p, hal.level, t - prev_t)
+            cpu, igpu = temp + row["spike"], temp - 1.0
+        else:
+            cpu = row["cpu"]
+            igpu = row["igpu"]
+        if not row["sensor_ok"]:
+            cpu = igpu = None
+        elif not row["cpu_ok"]:
+            cpu = None
+        prev_t, prev_p = t, (row["p_w"] if row["p_w"] is not None else prev_p)
+        hal.cpu, hal.igpu, hal.ac = cpu, igpu, row["ac"]
+        clock.set(t - t0, epoch0 + (t - t0))
+        if row["hold"] is not None and not legacy:
+            req = {"cmd": "hold", "level": row["hold"][0], "seconds": row["hold"][1]}
+            ctrl.handle_request(json.dumps(req), 1000)
+        if t + 1e-9 < next_tick:
+            continue
+        ctrl.tick()
+        next_tick += dt
+        if next_tick <= t:
+            next_tick = t + dt
+        ov = ctrl.override
+        # raw / fast / slow unrounded: acceptance checks compare them with the
+        # very thresholds the controller used (slow 81.96 < 82 must not read
+        # back as 82.0).
+        ticks.append({"t": round(t - t0, 3), "raw": ctrl.raw, "fast": ctrl.t_fast,
+                      "slow": ctrl.t_slow, "level": ctrl.level, "reason": ctrl.reason,
+                      "idx": ctrl.idx, "critical": ctrl.critical, "ac": ctrl.on_ac,
+                      "curve": ctrl.curve_name(), "sensor_lost": ctrl.sensor_lost,
+                      "override": None if ov is None else ov["level"],
+                      "suspended": bool(ov and ov["suspended"]),
+                      "model": None if temp is None else round(temp, 2)})
+    spacing = rows[1]["t"] - rows[0]["t"] if len(rows) > 1 else dt
+    duration = max(rows[-1]["t"] - t0 + spacing, dt)
+    summary = summarize(ctrl, ticks, duration, hal, cfg)
+    summary["mode"] = "legacy" if legacy else "v2"
+    summary["loop"] = "closed" if closed else "open"
+    if detail:
+        summary["ticks"] = ticks
+        summary["events"] = [[round(e[0] - epoch0, 3), e[1], e[2]] for e in ctrl.events]
+        summary["log"] = log.lines
+    return summary
+
+
+def summarize(ctrl, ticks, duration, hal, cfg):
+    """§13 summary.  The startup seat (first tick) is not a decision under test."""
+    start = ticks[0]["t"] if ticks else 0.0
+    trans = [tr for tr in ctrl.transitions if tr["t"] > start]
+    dwells = [b["t"] - a["t"] for a, b in zip(trans, trans[1:])]
+    reversals = [b["t"] - a["t"] for a, b in zip(trans, trans[1:])
+                 if a["from"] == b["to"] and a["to"] == b["from"]]
+    share = collections.Counter()
+    above = 0.0
+    crit = cfg["critical_temp"]
+    for i, tk in enumerate(ticks):
+        span = (ticks[i + 1]["t"] if i + 1 < len(ticks) else duration) - tk["t"]
+        share[str(tk["level"])] += span
+        if tk["raw"] is not None and tk["raw"] >= crit:
+            above += span
+    total = sum(share.values()) or 1.0
+    return {
+        "duration_s": round(duration, 1),
+        "ticks": len(ticks),
+        "transitions": len(trans),
+        "changes_per_hour": round(len(trans) * 3600.0 / duration, 2),
+        "median_dwell_s": round(statistics.median(dwells), 1) if dwells else None,
+        "min_dwell_s": round(min(dwells), 1) if dwells else None,
+        "min_gap_opposite_s": round(min(reversals), 1) if reversals else None,
+        "seconds_at_or_above_critical": round(above, 1),
+        "time_share_per_level": {k: round(v / total, 4) for k, v in sorted(share.items())},
+        "alerts": len(hal.alerts),
+        "alert_times": [round(t, 3) for t, _p in hal.alerts],
+        "final_level": ctrl.level,
+        "fan_writes": len(hal.writes),
+        "transition_list": [{**tr, "t": round(tr["t"], 3)} for tr in trans],
+        "config": cfg,
+    }
+
+
+def print_summary(summary, out):
+    out.write(f"\n=== summary ({summary['mode']}, {summary['loop']} loop) ===\n")
+    for key in ("duration_s", "transitions", "changes_per_hour", "median_dwell_s",
+                "min_dwell_s", "min_gap_opposite_s", "seconds_at_or_above_critical", "alerts",
+                "final_level"):
+        out.write(f"{key:>30}: {summary[key]}\n")
+    out.write(f"{'time_share_per_level':>30}: " + ", ".join(
+        f"{k}={v:.1%}" for k, v in summary["time_share_per_level"].items()) + "\n")
+
+# ── end of section: simulation ──
+
+
+# ── Trace generator (§13) ────────────────────────────────────────────────────
+
+SCENARIOS = ("idle", "load12", "load15", "load18", "stop", "ramp", "acflip",
+             "sensorloss", "override")
+TRACE_COLUMNS = ("t_s", "cpu", "igpu", "ac", "sensor_ok", "cpu_ok", "p_w", "spike_c",
+                 "model_c", "hold_level", "hold_seconds")
+
+
+def _bursts(n, idle, rng):
+    """
+    Tctl bursts: +5..14 C for 1-3 s, about every 25 s under load and every
+    60 s idle; while idle also +8 C load bursts of 3-6 s every 15-40 s.
+    """
+    spike = [0.0] * n
+    t = rng.uniform(5.0, 25.0)
+    while t < n:
+        i = int(t)
+        amp = rng.uniform(5.0, 14.0)
+        dur = rng.randint(1, 3)
+        for k in range(i, min(n, i + dur)):
+            spike[k] = max(spike[k], amp)
+        mean = 60.0 if idle[i] else 25.0
+        t = i + dur + rng.uniform(0.6 * mean, 1.4 * mean)
+    t = rng.uniform(15.0, 40.0)
+    while t < n:
+        i = int(t)
+        if not idle[i]:
+            t = i + 1
+            continue
+        dur = rng.randint(3, 6)
+        for k in range(i, min(n, i + dur)):
+            if idle[k]:
+                spike[k] += 8.0
+        t = i + dur + rng.uniform(15.0, 40.0)
+    return spike
+
+
+def _row(t):
+    return {"t": float(t), "cpu": None, "igpu": None, "ac": True, "sensor_ok": True,
+            "cpu_ok": True, "p_w": None, "spike": 0.0, "model": None, "hold": None}
+
+
+def gen_scenario(kind, seconds, seed):
+    """
+    Deterministic per seed: only random.Random(seed) is consulted.  Returns
+    rows for load_trace()'s format.  All scenarios except `ramp` are closed
+    loop (power + bursts; the reference cpu/igpu/model columns come from the
+    default controller in the loop); `ramp` is a scripted temperature path.
+    """
+    if kind not in SCENARIOS:
+        raise ValueError(f"unknown scenario {kind!r}; expected one of {', '.join(SCENARIOS)}")
+    n = max(120, int(seconds))
+    rng = random.Random(seed)
+    rows = [_row(t) for t in range(n)]
+    idle = [False] * n
+    t0_temp = 50.0
+
+    def walk(lo, hi, start, step=0.05):
+        p = start
+        for r in rows:
+            p = min(hi, max(lo, p + rng.uniform(-step, step)))
+            r["p_w"] = round(p, 3)
+
+    if kind == "idle":
+        idle = [True] * n
+        walk(3.0, 4.0, 3.5)
+        t0_temp = 48.0
+    elif kind in ("load12", "load15", "load18"):
+        base = float(kind[4:])
+        walk(base - 0.3, base + 0.3, base)
+    elif kind == "stop":
+        # 17 W holds the fan at the top step (disengaged settles near 74 C,
+        # above its 72 C release), so the load ends there and the whole
+        # dis -> 7 -> 6 -> 4 cascade is exercised.
+        end = max(120, int(n * 0.4))
+        for t, r in enumerate(rows):
+            r["p_w"] = 17.0 if t < end else 2.5
+            idle[t] = t >= end
+    elif kind == "ramp":
+        # Scripted open-loop excursion: 65 C, a 0.5 C/s ramp through 90 (the
+        # noise is smaller than the slope, so the first readings >= 90 are
+        # consecutive), a 92-94 C plateau long enough for repeat alerts, a
+        # slow decline, then 60 C.
+        a = int(n * 0.05)
+        plateau_end = a + 58 + int(n * 0.30)
+        decline_end = plateau_end + 340
+        for t, r in enumerate(rows):
+            if t < a:
+                temp = 65.0
+            elif t < a + 58:
+                temp = 65.0 + 0.5 * (t - a)
+            elif t < plateau_end:
+                temp = 93.0 + rng.uniform(-1.0, 1.0)
+            elif t < decline_end:
+                temp = 94.0 - 0.1 * (t - plateau_end)
+            else:
+                temp = 60.0
+            temp += rng.uniform(-0.2, 0.2)
+            r["cpu"] = round(temp, 2)
+            r["igpu"] = round(temp - 1.0, 2)
+        return rows
+    elif kind == "acflip":
+        walk(8.7, 9.3, 9.0)
+        t0_temp = 60.0
+        on_battery = set(range(n // 3, 2 * n // 3))
+        on_battery.add(n // 6)                           # 1-sample bounce
+        on_battery.discard(n // 2)                       # 1-sample bounce back to AC
+        on_battery.update((5 * n // 6, 5 * n // 6 + 1))  # 2-sample bounce
+        for t, r in enumerate(rows):
+            r["ac"] = t not in on_battery
+    elif kind == "sensorloss":
+        walk(9.7, 10.3, 10.0)
+        t0_temp = 60.0
+        lost = {n // 6} | {n // 4, n // 4 + 1} | set(range(n // 3, n // 3 + 30))
+        for t, r in enumerate(rows):
+            r["sensor_ok"] = t not in lost
+            r["cpu_ok"] = not (int(n * 0.2) <= t < int(n * 0.2) + 5)
+    elif kind == "override":
+        # Phases: idle; a hold at level 3 issued at t=60 under 9 W (the die
+        # settles near 75 C, so a +14 C Tctl burst reads >= 85 while T_fast
+        # stays below the 82 C ceiling); 16 W, which pushes T_fast over the
+        # ceiling (suspension and resumption); a 90 s 32 W burst into
+        # critical; 8 W until and past the hold's expiry at 0.6 n + 60.
+        t0_temp = 48.0
+        b, c = int(n * 0.25), int(n * 0.45)
+        for t, r in enumerate(rows):
+            r["p_w"] = 6.0 if t < 60 else 9.0 if t < b else 16.0 if t < c else \
+                32.0 if t < c + 90 else 8.0
+            idle[t] = t < 60
+        rows[60]["hold"] = ("3", int(n * 0.6))
+    spike = _bursts(n, idle, rng)
+    if kind == "override":
+        # One guaranteed 85 C-class Tctl burst while the hold should still be
+        # in force (§13: "level held through 85 C").
+        k = int(n * 0.15)
+        for i in range(k, min(n, k + 3)):
+            spike[i] = max(spike[i], 14.0)
+    for t, r in enumerate(rows):
+        r["spike"] = round(spike[t], 2)
+    rows[0]["model"] = t0_temp
+    ref = simulate(rows, sanitize({})[0], detail=True)
+    for r, tk in zip(rows, ref["ticks"]):
+        r["model"] = tk["model"]
+        if r["sensor_ok"]:
+            r["cpu"] = round(tk["model"] + r["spike"], 2) if r["cpu_ok"] else None
+            r["igpu"] = round(tk["model"] - 1.0, 2)
+    rows[0]["model"] = t0_temp
+    return rows
+
+
+def write_trace_csv(rows, out):
+    w = csv.writer(out, lineterminator="\n")
+    w.writerow(TRACE_COLUMNS)
+    for r in rows:
+        hold = r["hold"] or ("", "")
+        w.writerow([int(r["t"]), "" if r["cpu"] is None else r["cpu"],
+                    "" if r["igpu"] is None else r["igpu"], int(r["ac"]), int(r["sensor_ok"]),
+                    int(r["cpu_ok"]), "" if r["p_w"] is None else r["p_w"], r["spike"],
+                    "" if r["model"] is None else r["model"], hold[0], hold[1]])
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def parse_set(values):
+    """--set key=value: values are JSON when they parse (60, true, [...]), else strings."""
+    out = {}
+    for item in values or ():
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"--set expects key=value, got {item!r}")
+        try:
+            out[key] = json.loads(value)
+        except ValueError:
+            out[key] = value
+    return out
+
+
+def simulate_main(args):
+    try:
+        overrides = parse_set(args.set)
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        return 2
+    legacy = bool(overrides.pop("legacy", 0))
+    base = None
+    if args.config:
+        raw, _mtime, err = read_config_file(args.config)
+        if raw is None:
+            sys.stderr.write(f"cannot read {args.config}: {err}\n")
+            return 2
+        base = config_from_disk(raw, None)
+    cfg, rejected = sanitize(overrides, base)
+    if rejected:
+        sys.stderr.write(f"warning: --set ignored for {', '.join(rejected)}\n")
+    try:
+        rows = load_trace(args.simulate)
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"cannot load trace {args.simulate}: {e}\n")
+        return 2
+    if not rows:
+        sys.stderr.write(f"trace {args.simulate} has no usable rows\n")
+        return 2
+    echo = None if (args.json or args.quiet) else sys.stdout
+    summary = simulate(rows, cfg, legacy=legacy, open_loop=args.open_loop, echo=echo,
+                       detail=args.detail)
+    if args.json:
+        sys.stdout.write(json.dumps(summary, separators=(",", ":")) + "\n")
+    else:
+        print_summary(summary, sys.stdout)
+    return 0
+
+
+def gen_trace_main(args):
+    try:
+        rows = gen_scenario(args.gen_trace, args.seconds, args.seed)
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        return 2
+    write_trace_csv(rows, sys.stdout)
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="thinkpad-fan-controld",
+        description="ThinkPad fan control daemon v2 (docs/CONTRACT.md §13). "
+                    "Without options: run as the systemd service.")
+    p.add_argument("--version", action="store_true", help="print the version and exit")
+    p.add_argument("--save-config", action="store_true",
+                   help="stdin JSON -> config.json; prints {\"config\", \"rejected\"}")
+    p.add_argument("--self-test", action="store_true",
+                   help="hardware wait + level write-back + one state.json; no sound")
+    p.add_argument("--simulate", metavar="TRACE", help="trace.csv or history.json")
+    p.add_argument("--config", metavar="FILE", help="--simulate: config file (default: DEFAULTS)")
+    p.add_argument("--set", action="append", metavar="KEY=VALUE",
+                   help="--simulate: override a config key; legacy=1 runs the v1 rules")
+    p.add_argument("--json", action="store_true", help="--simulate: one JSON summary line")
+    p.add_argument("--quiet", action="store_true", help="--simulate: summary only")
+    p.add_argument("--detail", action="store_true",
+                   help="--simulate --json: include per-tick records, events and log lines")
+    p.add_argument("--open-loop", action="store_true",
+                   help="--simulate: replay the recorded temperatures even if p_w is present")
+    p.add_argument("--gen-trace", metavar="SCENARIO", choices=SCENARIOS,
+                   help="print a synthetic trace CSV: " + "|".join(SCENARIOS))
+    p.add_argument("--seconds", type=int, default=3600, help="--gen-trace length (default 3600)")
+    p.add_argument("--seed", type=int, default=1, help="--gen-trace seed (default 1)")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.version:
+        sys.stdout.write(f"thinkpad-fan-controld {VERSION}\n")
+        return 0
+    if args.save_config:
+        return save_config_main()
+    if args.self_test:
+        return self_test_main()
+    if args.simulate:
+        return simulate_main(args)
+    if args.gen_trace:
+        return gen_trace_main(args)
+    return run_daemon()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

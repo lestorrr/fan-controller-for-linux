@@ -1,0 +1,7 @@
+jhnlstrlclcn ALL=(ALL) NOPASSWD: /usr/local/bin/fan-set-level.sh
+jhnlstrlclcn ALL=(ALL) NOPASSWD: /usr/local/bin/fan-config-save.sh
+jhnlstrlclcn ALL=(ALL) NOPASSWD: /usr/local/bin/ryzenadj-set-tdp.sh
+jhnlstrlclcn ALL=(ALL) NOPASSWD: /usr/local/bin/ryzenadj --info
+jhnlstrlclcn ALL=(ALL) NOPASSWD: /usr/bin/systemctl start thinkpad-fan-control.service
+jhnlstrlclcn ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop thinkpad-fan-control.service
+jhnlstrlclcn ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart thinkpad-fan-control.service

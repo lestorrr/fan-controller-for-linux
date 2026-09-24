@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+ThinkPad automatic fan control daemon.
+
+Reads /etc/thinkpad-fan-control/config.json and drives /proc/acpi/ibm/fan.
+Self-contained on purpose: this runs as root, so it must not import anything
+out of a user-writable directory.
+
+Improvements over the shell version it replaces:
+  * hwmon paths are discovered by driver name (hwmonN numbering is not stable)
+  * the control temperature is max(CPU Tctl, iGPU edge), not CPU alone
+  * hysteresis, so a temperature sitting on a threshold stops oscillating
+  * curve comes from a config file and hot-reloads without a restart
+  * a separate, quieter curve while on battery
+  * optional EC watchdog, so a daemon crash can't leave the fan pinned
+"""
+
+import glob
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+FAN_PROC    = "/proc/acpi/ibm/fan"
+CONFIG_FILE = "/etc/thinkpad-fan-control/config.json"
+LOG_FILE    = "/var/log/thinkpad-fan-control.log"
+AC_ONLINE   = "/sys/class/power_supply/AC/online"
+
+ALERT_USER = "jhnlstrlclcn"
+ALERT_UID  = 1000
+
+VALID_LEVELS = {"auto", "disengaged", "full-speed"} | {str(i) for i in range(8)}
+
+DEFAULTS = {
+    "poll_interval": 3,
+    "hysteresis": 5,
+    "critical_temp": 90,
+    "curve": [
+        {"temp": 0,  "level": "auto"},
+        {"temp": 50, "level": "4"},
+        {"temp": 60, "level": "6"},
+        {"temp": 70, "level": "7"},
+        {"temp": 80, "level": "disengaged"},
+    ],
+    "battery_curve": [
+        {"temp": 0,  "level": "auto"},
+        {"temp": 60, "level": "3"},
+        {"temp": 70, "level": "5"},
+        {"temp": 80, "level": "7"},
+        {"temp": 87, "level": "disengaged"},
+    ],
+    "use_battery_curve": True,
+    "alerts_enabled": True,
+    "alert_sound": "/home/jhnlstrlclcn/Music/SYSTEM SOUND/90c.mp3",
+    "alert_cooldown": 300,
+    "watchdog": 0,
+}
+
+
+def log(msg):
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
+    except OSError:
+        sys.stderr.write(line)
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+# ── Sensors ──────────────────────────────────────────────────────────────────
+
+_hwmon_cache = {}
+
+
+def hwmon_dir(name):
+    cached = _hwmon_cache.get(name)
+    if cached and read_file(os.path.join(cached, "name")) == name:
+        return cached
+    for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        n = read_file(os.path.join(d, "name"))
+        if n:
+            _hwmon_cache[n] = d
+    return _hwmon_cache.get(name)
+
+
+def hwmon_temp(name, attr="temp1_input"):
+    d = hwmon_dir(name)
+    if not d:
+        return None
+    raw = read_file(os.path.join(d, attr))
+    try:
+        c = int(raw) // 1000
+    except (TypeError, ValueError):
+        return None
+    # A disconnected thinkpad_acpi sensor reads 0; that must never look "cool".
+    return c if 0 < c < 150 else None
+
+
+def control_temp():
+    """Hottest of CPU Tctl and iGPU edge — they share a die on this APU."""
+    vals = [t for t in (hwmon_temp("k10temp"), hwmon_temp("amdgpu")) if t]
+    return max(vals) if vals else None
+
+
+def on_ac():
+    v = read_file(AC_ONLINE)
+    return v != "0"          # assume AC if the sysfs node is missing
+
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+def valid_curve(curve):
+    if not isinstance(curve, list) or not 1 <= len(curve) <= 8:
+        return None
+    out = []
+    for step in curve:
+        try:
+            t, lvl = int(step["temp"]), str(step["level"])
+        except (TypeError, KeyError, ValueError):
+            return None
+        if not 0 <= t <= 105 or lvl not in VALID_LEVELS:
+            return None
+        out.append({"temp": t, "level": lvl})
+    out.sort(key=lambda s: s["temp"])
+    out[0]["temp"] = 0
+    if len({s["temp"] for s in out}) != len(out):
+        return None
+    return out
+
+
+def sanitize(raw, base=None):
+    """
+    Clamp `raw` into a range that can't cook the laptop.
+
+    Fields that are missing or invalid fall back to `base` (the config already
+    on disk) rather than to DEFAULTS, so one bad field in a partial write can't
+    silently reset a curve the user spent time tuning.
+    """
+    cfg = json.loads(json.dumps(base if base else DEFAULTS))
+    if not isinstance(raw, dict):
+        return cfg
+    for key, lo, hi in (("poll_interval", 1, 60), ("hysteresis", 0, 20),
+                        ("critical_temp", 70, 105), ("alert_cooldown", 30, 3600),
+                        ("watchdog", 0, 120)):
+        try:
+            cfg[key] = max(lo, min(hi, int(raw[key])))
+        except (KeyError, TypeError, ValueError):
+            pass
+    for key in ("use_battery_curve", "alerts_enabled"):
+        if key in raw:
+            cfg[key] = bool(raw[key])
+    if isinstance(raw.get("alert_sound"), str):
+        cfg["alert_sound"] = raw["alert_sound"][:400]
+    for key in ("curve", "battery_curve"):
+        c = valid_curve(raw.get(key))
+        if c:
+            cfg[key] = c
+    return cfg
+
+
+def load_config():
+    raw = read_file(CONFIG_FILE)
+    if not raw:
+        return sanitize({})
+    try:
+        return sanitize(json.loads(raw))
+    except json.JSONDecodeError:
+        log("WARN: config.json is not valid JSON — using defaults")
+        return sanitize({})
+
+
+def config_mtime():
+    try:
+        return os.stat(CONFIG_FILE).st_mtime
+    except OSError:
+        return 0.0
+
+
+def save_config_from_stdin():
+    """
+    `--save-config` mode, invoked through sudo by the GUI.
+
+    Validation lives here rather than in the GUI so that the only code that can
+    write the config is the same root-owned code that consumes it.
+    """
+    try:
+        raw = json.loads(sys.stdin.read())
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"invalid JSON: {e}\n")
+        return 1
+    cfg = sanitize(raw, base=load_config())
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONFIG_FILE)      # atomic: readers never see a half file
+    os.chmod(CONFIG_FILE, 0o644)
+    log("Config updated from GUI")
+    return 0
+
+
+# ── Fan ──────────────────────────────────────────────────────────────────────
+
+def fan_write(command):
+    try:
+        with open(FAN_PROC, "w") as f:
+            f.write(command)
+        return True
+    except OSError as e:
+        log(f"ERROR: writing '{command}' to {FAN_PROC} failed: {e}")
+        return False
+
+
+class Fan:
+    """Tracks the level we last set so we only write to the EC on a change."""
+
+    def __init__(self):
+        self.level = None
+        self.set_at = 0.0
+
+    def set(self, level, temp, reason=""):
+        now = time.monotonic()
+        # A watchdog-armed EC reverts to auto on its own, so refresh
+        # periodically even when the target level hasn't changed.
+        stale = now - self.set_at > 30
+        if level == self.level and not stale:
+            return
+        if fan_write(f"level {level}"):
+            if level != self.level:
+                log(f"Fan → {level} (control temp {temp}°C){reason}")
+            self.level = level
+            self.set_at = now
+
+
+# ── Alerts ───────────────────────────────────────────────────────────────────
+
+def play_sound(path):
+    if not os.path.exists(path):
+        return
+    player = ["paplay"] if path.endswith(".wav") else \
+             ["gst-play-1.0", "--no-interactive", "--volume=1.0"]
+    env = {
+        "XDG_RUNTIME_DIR": f"/run/user/{ALERT_UID}",
+        "PULSE_SERVER": f"unix:/run/user/{ALERT_UID}/pulse/native",
+        "PATH": "/usr/bin:/bin",
+    }
+    try:
+        subprocess.Popen(
+            ["sudo", "-u", ALERT_USER] +
+            [f"{k}={v}" for k, v in env.items()] + player + [path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except OSError as e:
+        log(f"WARN: could not play alert sound: {e}")
+
+
+# ── Curve ────────────────────────────────────────────────────────────────────
+
+def pick_step(curve, temp, idx, hyst):
+    """
+    Walk to the step matching `temp`, starting from the current index.
+
+    Rising uses the raw threshold; falling requires the temperature to drop
+    `hyst` degrees *below* the threshold before stepping down. That gap is what
+    stops a temperature parked on a boundary from flapping the fan every poll.
+    """
+    idx = max(0, min(idx, len(curve) - 1))
+    while idx + 1 < len(curve) and temp >= curve[idx + 1]["temp"]:
+        idx += 1
+    while idx > 0 and temp < curve[idx]["temp"] - hyst:
+        idx -= 1
+    return idx
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+fan = Fan()
+
+
+def shutdown(signum, _frame):
+    log("Daemon stopping — returning fan to firmware control")
+    fan_write("watchdog 0")
+    fan_write("level auto")
+    sys.exit(0)
+
+
+def main():
+    if "--save-config" in sys.argv:
+        return save_config_from_stdin()
+
+    if not os.path.exists(FAN_PROC):
+        log(f"FATAL: {FAN_PROC} not found — is thinkpad_acpi loaded with "
+            f"fan_control=1?")
+        return 1
+    if control_temp() is None:
+        log("FATAL: no usable temperature sensor (k10temp / amdgpu)")
+        return 1
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    cfg = load_config()
+    mtime = config_mtime()
+    log(f"Daemon started. PID={os.getpid()} config={CONFIG_FILE}")
+
+    idx = 0
+    last_alert = 0.0
+    last_ac = None
+    armed_watchdog = None
+
+    while True:
+        temp = control_temp()
+
+        if config_mtime() != mtime:
+            mtime = config_mtime()
+            cfg = load_config()
+            idx = 0
+            armed_watchdog = None
+            log("Config reloaded")
+
+        # The EC watchdog reverts the fan to auto if we stop writing, which is
+        # the failsafe if this process is killed without its SIGTERM handler.
+        if cfg["watchdog"] != armed_watchdog:
+            armed_watchdog = cfg["watchdog"]
+            fan_write(f"watchdog {armed_watchdog}")
+            log(f"EC watchdog set to {armed_watchdog}s"
+                if armed_watchdog else "EC watchdog disabled")
+
+        if temp is None:
+            # Losing the sensor is the one case where guessing is dangerous:
+            # hand control back to the firmware rather than hold a level.
+            log("WARN: temperature sensor unreadable — falling back to auto")
+            fan.set("auto", 0)
+            time.sleep(cfg["poll_interval"])
+            continue
+
+        ac = on_ac()
+        if ac != last_ac:
+            if last_ac is not None:
+                log(f"Power source → {'AC' if ac else 'battery'}")
+            last_ac = ac
+            idx = 0
+
+        curve = cfg["curve"]
+        if not ac and cfg["use_battery_curve"]:
+            curve = cfg["battery_curve"]
+
+        if temp >= cfg["critical_temp"]:
+            # Above critical the curve is ignored outright.
+            fan.set("disengaged", temp, " — CRITICAL")
+            idx = len(curve) - 1
+            now = time.monotonic()
+            if cfg["alerts_enabled"] and now - last_alert >= cfg["alert_cooldown"]:
+                last_alert = now
+                play_sound(cfg["alert_sound"])
+                log(f"ALERT: {temp}°C is at or above the "
+                    f"{cfg['critical_temp']}°C critical threshold")
+        else:
+            idx = pick_step(curve, temp, idx, cfg["hysteresis"])
+            fan.set(curve[idx]["level"], temp)
+
+        time.sleep(cfg["poll_interval"])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

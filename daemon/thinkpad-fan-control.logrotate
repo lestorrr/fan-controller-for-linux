@@ -1,0 +1,9 @@
+/var/log/thinkpad-fan-control.log {
+    size 2M
+    rotate 2
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0644 root root
+}

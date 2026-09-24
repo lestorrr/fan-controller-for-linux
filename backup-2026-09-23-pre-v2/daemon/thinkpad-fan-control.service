@@ -1,0 +1,19 @@
+[Unit]
+Description=ThinkPad Automatic Fan Control Daemon
+After=multi-user.target
+ConditionPathExists=/proc/acpi/ibm/fan
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thinkpad-fan-controld
+Restart=always
+RestartSec=5
+# Give the daemon its SIGTERM handler time to hand the fan back to the
+# firmware instead of being SIGKILLed with the fan still pinned.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
