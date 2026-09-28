@@ -7,6 +7,13 @@ Every schema, path and behaviour is specified in
 [`docs/CONTRACT.md`](docs/CONTRACT.md); this README explains it in prose. When
 the two disagree, the contract wins.
 
+> **Use at your own risk.** This is written for one machine, a ThinkPad T495
+> with a Ryzen 5 PRO 3500U. It takes over the embedded controller's fan
+> control and changes the CPU's power limits through `ryzenadj`. On other
+> hardware it may not work, or it may keep the fan slower or the CPU hotter
+> than the laptop's own firmware would. Not affiliated with Lenovo;
+> "ThinkPad" is Lenovo's trademark.
+
 There are two parts:
 
 * **`thinkpad-fan-controld`** is a root daemon under systemd. It reads the die
@@ -22,12 +29,15 @@ Either part works without the other. The daemon needs no GUI. Without the
 daemon, the GUI can still read sensors and set the fan by hand, and it shows
 a red "no thermal protection" warning while it does.
 
+![The dashboard's Overview tab, with simulated data from tests/mock_api.py](docs/screenshots/dashboard.png)
+
 Contents: [1 Pieces](#1-the-pieces-and-how-they-talk) ·
 [2 Install](#2-install-upgrade-uninstall) · [3 Dashboard](#3-running-the-dashboard) ·
 [4 Controller](#4-how-the-controller-decides) · [5 Holds](#5-holds-and-the-safety-envelope) ·
 [6 Power](#6-power-limits-tdp-and-vrm-current) · [7 Simulator](#7-the-simulator) ·
 [8 Keys](#8-keyboard-shortcuts) · [9 Files](#9-where-things-live) ·
-[10 Troubleshooting](#10-troubleshooting) · [11 Tests](#11-offline-tests)
+[10 Troubleshooting](#10-troubleshooting) · [11 Tests](#11-offline-tests) ·
+[12 License](#12-license)
 
 ---
 
@@ -829,3 +839,8 @@ such as `curve`, `hold`, `critical`, `daemon_down`, `manual_unprotected`,
 `stale`, `smu_missing`, `sensor_lost`, `freeze` and `battery` (the list is
 in the file's header). It is a development aid with its own simplified
 controller, not a reference for daemon behaviour.
+
+## 12. License
+
+MIT, see [LICENSE](LICENSE). © 2026 John Lester Liclican ·
+[@lestorrr](https://github.com/lestorrr) · [jhnlstrlclcn.engineer](https://jhnlstrlclcn.engineer/)
